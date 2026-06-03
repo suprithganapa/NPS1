@@ -25,7 +25,10 @@ ROOT = Path(__file__).resolve().parent.parent
 console = Console()
 
 SESSION_GAP = 2.0
-KNOCK_PACKETS = 512
+# Jitter knock: 1 leading echo + one packet per jitter gap
+KNOCK_PACKETS = 513
+# Header knock (same-host loopback): 21 packets from encode_header_sequence
+KNOCK_HEADER_PACKETS = 21
 
 
 class AuthRegistry:
@@ -247,29 +250,24 @@ def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) 
         )
 
     def process(src_ip: str, events: list[CaptureEvent]) -> None:
-        from nps_lab_el.protocol.decode import is_likely_knock
-
-        session = engine.process_events(events)
-        jc = cfg.channels.jitter
-        if session.state != AuthorizationState.AUTHORIZED:
-            if same_host and len(events) >= KNOCK_PACKETS - 32:
-                console.print(
-                    f"[yellow]Lab same-host: full knock burst ({len(events)} pkts) — authorizing {src_ip}[/yellow]"
-                )
-                session = session.model_copy(update={"state": AuthorizationState.AUTHORIZED})
-            elif len(events) >= 400 and is_likely_knock(
-                events,
-                min_symbols=400,
-                t0_ms=jc.t0_ms,
-                delta_ms=jc.delta_ms,
-                tau_ms=jc.tau_ms,
-            ):
-                console.print(
-                    f"[yellow]Lab: timing pattern matched ({len(events)} pkts) — authorizing {src_ip}[/yellow]"
-                )
-                session = session.model_copy(update={"state": AuthorizationState.AUTHORIZED})
-
+        try:
+            session = engine.process_events(events)
+            if session.state == AuthorizationState.DENIED and same_host:
+                for relaxed_tau in (25, 50):
+                    retry = engine.process_events(events, jitter_tau_ms=relaxed_tau)
+                    if retry.state == AuthorizationState.AUTHORIZED:
+                        console.print(f"[dim]  loopback decode ok with tau_ms={relaxed_tau}[/dim]")
+                        session = retry
+                        break
+        except Exception as exc:
+            console.print(f"[red]Knock processing error from {src_ip}: {exc}[/red]")
+            return
         console.print(f"[bold]Knock from {src_ip}: {session.state}[/bold]  ({len(events)} packets)")
+        if session.state == AuthorizationState.DENIED:
+            console.print(
+                "[dim]  DENIED = bad timing decode, wrong totp_secret, or MAC mismatch "
+                "(knocker.yaml and server.yaml must match)[/dim]"
+            )
         if session.state == AuthorizationState.AUTHORIZED:
             registry.authorize(src_ip)
             if cfg.server.ip == cfg.client.ip and src_ip == "127.0.0.1":
@@ -311,7 +309,8 @@ def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) 
             events_by_src[src] = []
             buf = events_by_src[src]
         buf.append(event)
-        if len(buf) >= KNOCK_PACKETS:
+        flush_at = KNOCK_HEADER_PACKETS if same_host else KNOCK_PACKETS
+        if len(buf) >= flush_at:
             process(src, buf)
             events_by_src[src] = []
 

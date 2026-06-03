@@ -22,15 +22,19 @@ class AuthEngine:
         self.replay_cache: dict[str, int] = {}
         self.active_sessions: dict[str, KnockSession] = {}
 
-    def process_events(self, events: list[CaptureEvent]) -> KnockSession:
+    def process_events(
+        self, events: list[CaptureEvent], *, jitter_tau_ms: int | None = None
+    ) -> KnockSession:
         if not events:
             return KnockSession(src_ip="unknown", state=AuthorizationState.DENIED)
         sessions = sessionize_events(events)
         session: KnockSession | None = None
         for group in sessions:
-            token = self._try_jitter_decode(group)
-            if token is None:
+            token = None
+            if self.config.channels.header.enabled:
                 token = self._try_header_decode(group)
+            if token is None:
+                token = self._try_jitter_decode(group, tau_ms=jitter_tau_ms)
             src_ip = group[0].src
             if token is not None and self._verify_token(token, src_ip):
                 session = self._create_session(src_ip, group, AuthorizationState.AUTHORIZED)
@@ -41,7 +45,9 @@ class AuthEngine:
             return KnockSession(src_ip=events[0].src, state=AuthorizationState.DENIED)
         return session
 
-    def _try_jitter_decode(self, events: list[CaptureEvent]) -> AuthToken | None:
+    def _try_jitter_decode(
+        self, events: list[CaptureEvent], *, tau_ms: int | None = None
+    ) -> AuthToken | None:
         jc = self.config.channels.jitter
         if not jc.enabled:
             return None
@@ -49,14 +55,20 @@ class AuthEngine:
             events,
             t0_ms=jc.t0_ms,
             delta_ms=jc.delta_ms,
-            tau_ms=jc.tau_ms,
+            tau_ms=tau_ms if tau_ms is not None else jc.tau_ms,
             fec_n=self.config.fec.n,
             fec_k=self.config.fec.k,
             expected_bits=AuthToken.total_bits(),
         )
-        if bits is None:
+        return self._bits_to_token(bits)
+
+    def _bits_to_token(self, bits: list[int] | None) -> AuthToken | None:
+        if bits is None or len(bits) < AuthToken.total_bits():
             return None
-        return AuthToken.from_bits(bits)
+        try:
+            return AuthToken.from_bits(bits)
+        except IndexError:
+            return None
 
     def _try_header_decode(self, events: list[CaptureEvent]) -> AuthToken | None:
         hc = self.config.channels.header
@@ -65,9 +77,7 @@ class AuthEngine:
         ip_ids = [e.ip_id for e in events]
         icmp_seqs = [e.icmp_seq for e in events]
         bits = decode_header_sequence(ip_ids, icmp_seqs, lfsr_seed=hc.lfsr_seed)
-        if bits is None:
-            return None
-        return AuthToken.from_bits(bits)
+        return self._bits_to_token(bits)
 
     def _verify_token(self, token: AuthToken, src_ip: str) -> bool:
         secret = self.config.auth.totp_secret

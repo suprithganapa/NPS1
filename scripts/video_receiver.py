@@ -105,45 +105,70 @@ def _sniff_for_fragment(
     sniff(**sniff_kwargs)
 
 
-def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
-    """Send ICMP knock and return the 4-byte key fragment from the server reply, or None on simulation."""
+def _build_auth_token(cfg, channel_mask: int) -> "AuthToken":
     from nps_lab_el.crypto.totp import get_counter
     from nps_lab_el.models.auth import AuthToken
+
+    counter = get_counter(cfg.auth.window_seconds)
+    payload = os.urandom(16)
+    mac_input = payload + counter.to_bytes(8, "big") + channel_mask.to_bytes(1, "big")
+    mac = hmac.new(cfg.auth.totp_secret.encode(), mac_input, hashlib.sha256).digest()[:16]
+    return AuthToken(payload=payload, totp_counter=counter, channel_mask=channel_mask, mac=mac)
+
+
+def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
+    """Send ICMP knock and return the 4-byte key fragment from the server reply, or None on simulation."""
     from nps_lab_el.platform.permissions import require_privileges
     from nps_lab_el.protocol.encode_jitter import encode_with_fec
 
     require_privileges(simulation=simulation)
-    counter = get_counter(cfg.auth.window_seconds)
-    payload = os.urandom(16)
-    channel_mask = 1
-    mac_input = payload + counter.to_bytes(8, "big") + channel_mask.to_bytes(1, "big")
-    mac = hmac.new(cfg.auth.totp_secret.encode(), mac_input, hashlib.sha256).digest()[:16]
-    token = AuthToken(payload=payload, totp_counter=counter, channel_mask=channel_mask, mac=mac)
-    jitter_sequence = encode_with_fec(
-        token.to_bits(),
-        n=cfg.fec.n,
-        k=cfg.fec.k,
-        t0_ms=cfg.channels.jitter.t0_ms,
-        delta_ms=cfg.channels.jitter.delta_ms,
-    )
-
-    if simulation:
-        console.print(f"[cyan]Simulation knock[/cyan] ({len(jitter_sequence)} intervals, not sent)")
-        return None
-
-    from scapy.all import ICMP, IP, send
 
     knock_target = resolve_knock_target(server_ip, cfg.client.ip)
-    session_nonce = int.from_bytes(os.urandom(2), "big")
-    est_sec = _estimate_knock_seconds(jitter_sequence)
-    console.print(
-        f"[green]Sending knock to {knock_target}[/green] "
-        f"({len(jitter_sequence)} packets, ~{est_sec:.0f}s)..."
-    )
+    use_header = knock_target == "127.0.0.1" and cfg.channels.header.enabled
+
+    if use_header:
+        from nps_lab_el.protocol.encode_header import encode_header_sequence
+
+        channel_mask = 0x02
+        token = _build_auth_token(cfg, channel_mask)
+        header_pairs = encode_header_sequence(
+            token.to_bits(), lfsr_seed=cfg.channels.header.lfsr_seed
+        )
+        if simulation:
+            console.print(f"[cyan]Simulation header knock[/cyan] ({len(header_pairs)} packets)")
+            return None
+        est_sec = len(header_pairs) * 0.01
+        console.print(
+            f"[green]Sending header knock to {knock_target}[/green] "
+            f"({len(header_pairs)} packets, ~{est_sec:.1f}s, loopback-safe)..."
+        )
+    else:
+        channel_mask = 0x01
+        token = _build_auth_token(cfg, channel_mask)
+        jitter_sequence = encode_with_fec(
+            token.to_bits(),
+            n=cfg.fec.n,
+            k=cfg.fec.k,
+            t0_ms=cfg.channels.jitter.t0_ms,
+            delta_ms=cfg.channels.jitter.delta_ms,
+        )
+        if simulation:
+            console.print(f"[cyan]Simulation knock[/cyan] ({len(jitter_sequence)} intervals, not sent)")
+            return None
+        est_sec = _estimate_knock_seconds(jitter_sequence)
+        packet_count = len(jitter_sequence) + 1
+        console.print(
+            f"[green]Sending jitter knock to {knock_target}[/green] "
+            f"({packet_count} packets, ~{est_sec:.0f}s)..."
+        )
+
     if knock_target != server_ip:
         console.print(f"[dim]  (same PC — using loopback; server IP in config is {server_ip})[/dim]")
     console.print("[dim]Server must be running (Admin) with ICMP sniffer — not --http-only[/dim]")
 
+    from scapy.all import ICMP, IP, send
+
+    session_nonce = int.from_bytes(os.urandom(2), "big")
     stop_sniff = threading.Event()
     fragment_result: list[bytes] = []
     sniff_iface = r"\Device\NPF_Loopback" if sys.platform == "win32" and knock_target == "127.0.0.1" else None
@@ -156,13 +181,22 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
     sniffer.start()
     time.sleep(0.5)
 
-    total = len(jitter_sequence)
-    for i, delay in enumerate(jitter_sequence):
-        send(IP(dst=knock_target) / ICMP(type=8, id=session_nonce, seq=i), verbose=False)
-        precise_sleep(delay)
-        if (i + 1) % 64 == 0 or i + 1 == total:
-            pct = 100 * (i + 1) // total
-            console.print(f"[dim]  knock progress: {i + 1}/{total} ({pct}%)[/dim]")
+    if use_header:
+        for i, (ip_id, icmp_seq) in enumerate(header_pairs):
+            send(
+                IP(dst=knock_target, id=ip_id) / ICMP(type=8, id=session_nonce, seq=icmp_seq),
+                verbose=False,
+            )
+            precise_sleep(0.01)
+    else:
+        send(IP(dst=knock_target) / ICMP(type=8, id=session_nonce, seq=0), verbose=False)
+        total = len(jitter_sequence)
+        for i, delay in enumerate(jitter_sequence):
+            precise_sleep(delay)
+            send(IP(dst=knock_target) / ICMP(type=8, id=session_nonce, seq=i + 1), verbose=False)
+            if (i + 1) % 64 == 0 or i + 1 == total:
+                pct = 100 * (i + 1) // total
+                console.print(f"[dim]  knock progress: {i + 1}/{total} gaps ({pct}%)[/dim]")
 
     console.print("[green]Knock sent — waiting for server ICMP reply (key fragment)...[/green]")
     console.print("[dim]  server needs ~2s after last packet to authorize[/dim]")

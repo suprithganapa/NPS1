@@ -62,11 +62,13 @@ def cli(config_path: str, target: str, simulation: bool) -> None:
 
         from scapy.all import ICMP, IP, send
 
-        console.print(f"[bold green]Sending knock to {target}[/bold green] ({len(jitter_sequence)} packets)...")
+        packet_count = len(jitter_sequence) + 1
+        console.print(f"[bold green]Sending knock to {target}[/bold green] ({packet_count} packets)...")
+        send(IP(dst=target) / ICMP(type=8, seq=0), verbose=False)
         for i, delay in enumerate(jitter_sequence):
-            pkt = IP(dst=target) / ICMP(type=8, seq=i)
-            send(pkt, verbose=False)
             time.sleep(delay)
+            pkt = IP(dst=target) / ICMP(type=8, seq=i + 1)
+            send(pkt, verbose=False)
         console.print("[bold green]Knock sequence sent.[/bold green]")
 
     console.print(f"[dim]TOTP counter: {counter} | Token bits: {len(token_bits)}[/dim]")

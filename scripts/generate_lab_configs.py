@@ -70,8 +70,8 @@ def base_auth_block() -> dict:
             "ttl_auth_seconds": 300,
         },
         "channels": {
-            "jitter": {"enabled": True, "t0_ms": 20, "delta_ms": 5, "tau_ms": 2},
-            "header": {"enabled": False, "lfsr_seed": 44257, "windows_compat": True},
+            "jitter": {"enabled": True, "t0_ms": 20, "delta_ms": 5, "tau_ms": 8},
+            "header": {"enabled": True, "lfsr_seed": 44257, "windows_compat": True},
             "dns": {"enabled": False},
         },
         "fec": {"enabled": True, "n": 32, "k": 28},
