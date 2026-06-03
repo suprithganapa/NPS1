@@ -23,7 +23,10 @@ class AuthEngine:
         self.active_sessions: dict[str, KnockSession] = {}
 
     def process_events(self, events: list[CaptureEvent]) -> KnockSession:
+        if not events:
+            return KnockSession(src_ip="unknown", state=AuthorizationState.DENIED)
         sessions = sessionize_events(events)
+        session: KnockSession | None = None
         for group in sessions:
             token = self._try_jitter_decode(group)
             if token is None:
@@ -34,7 +37,9 @@ class AuthEngine:
             else:
                 session = self._create_session(src_ip, group, AuthorizationState.DENIED)
             self.active_sessions[session.session_id] = session
-        return session  # type: ignore[possibly-undefined]
+        if session is None:
+            return KnockSession(src_ip=events[0].src, state=AuthorizationState.DENIED)
+        return session
 
     def _try_jitter_decode(self, events: list[CaptureEvent]) -> AuthToken | None:
         jc = self.config.channels.jitter

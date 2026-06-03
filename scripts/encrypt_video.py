@@ -15,6 +15,8 @@ import os
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+
 
 def encrypt_video(video_path: Path) -> None:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -29,7 +31,7 @@ def encrypt_video(video_path: Path) -> None:
 
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)
 
-    artifacts = video_path.parent.parent / "artifacts"
+    artifacts = ROOT / "artifacts"
     artifacts.mkdir(exist_ok=True)
 
     stem = video_path.stem
@@ -58,7 +60,7 @@ def encrypt_video(video_path: Path) -> None:
     print("Clients must complete the ICMP knock to receive it.")
 
     # Write key_fragment to a server-side secrets file (gitignored)
-    secrets_dir = video_path.parent.parent / "server_secrets"
+    secrets_dir = ROOT / "server_secrets"
     secrets_dir.mkdir(exist_ok=True)
     secret_path = secrets_dir / f"{stem}.keyfrag"
     secret_path.write_bytes(key_fragment)

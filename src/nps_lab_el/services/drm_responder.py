@@ -5,6 +5,9 @@ from nps_lab_el.crypto.totp import get_counter
 from nps_lab_el.models.auth import KnockSession
 from nps_lab_el.models.config import AppConfig
 
+# Marks lab DRM ICMP replies (Windows auto-replies use code 0).
+DRM_ICMP_CODE = 0x5A
+
 
 class DrmResponder:
     def __init__(self, config: AppConfig) -> None:
@@ -31,7 +34,7 @@ class DrmResponder:
         fields = self.encode_reply_fields(fragment, session_nonce)
         return (
             IP(src=src_ip, dst=dst_ip, ttl=fields["ttl"], tos=fields["tos"])
-            / ICMP(type=0, id=fields["icmp_id"], seq=0)
+            / ICMP(type=0, code=DRM_ICMP_CODE, id=fields["icmp_id"], seq=0)
         )
 
     @staticmethod

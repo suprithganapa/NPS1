@@ -6,10 +6,18 @@ from nps_lab_el.models.auth import CaptureEvent
 
 
 class CaptureBackend:
-    def __init__(self, iface: str, server_ip: str, simulation: bool = False) -> None:
+    def __init__(
+        self,
+        iface: str,
+        server_ip: str,
+        simulation: bool = False,
+        *,
+        same_host: bool = False,
+    ) -> None:
         self.iface = iface
         self.server_ip = server_ip
         self.simulation = simulation
+        self.same_host = same_host
 
     def start_capture(
         self,
@@ -43,15 +51,20 @@ class CaptureBackend:
         ip_layer = packet[IP]
         icmp_layer = packet[ICMP]
 
-        if icmp_layer.type == 8 and ip_layer.dst == self.server_ip:
+        dst_ok = ip_layer.dst == self.server_ip
+        if self.same_host and icmp_layer.type == 8 and ip_layer.dst == "127.0.0.1":
+            dst_ok = True
+
+        if icmp_layer.type == 8 and dst_ok:
             pass
         elif icmp_layer.type == 0 and ip_layer.src == self.server_ip:
             pass
         else:
             return None
 
+        pkt_ts = float(getattr(packet, "time", time.time()))
         return CaptureEvent(
-            ts=time.time(),
+            ts=pkt_ts,
             src=ip_layer.src,
             dst=ip_layer.dst,
             icmp_id=icmp_layer.id,
