@@ -67,10 +67,10 @@ def encrypt_video(video_path: Path) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        video = Path(__file__).parent.parent / "artifacts" / "sample_video.mp4"
-    else:
-        video = Path(sys.argv[1])
+        print("Usage: python scripts/encrypt_video.py <path/to/video.mp4>")
+        sys.exit(1)
 
+    video = Path(sys.argv[1])
     if not video.exists():
         print(f"File not found: {video}")
         sys.exit(1)

@@ -11,8 +11,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
 import json
 import sys
 import threading
@@ -61,39 +59,19 @@ class AuthRegistry:
         self.authorize(ip)
 
 
-def load_decrypted_video(cfg) -> bytes:
-    from nps_lab_el.crypto.aes_gcm import decrypt_artifact
-    from nps_lab_el.models.auth import KeyMaterial
-
+def load_encrypted_video(cfg) -> tuple[bytes, str]:
     manifest_path = ROOT / cfg.video.artifact_manifest
     enc_path = ROOT / cfg.video.artifact_enc
-    keyfrag_path = ROOT / cfg.video.keyfrag
 
     if not manifest_path.is_file() or not enc_path.is_file():
         console.print("[red]Missing video artifacts. Run:[/red]")
-        console.print("  python scripts/generate_sample_video.py")
-        console.print("  python scripts/encrypt_video.py")
+        console.print("  python scripts/encrypt_video.py /path/to/your_video.mp4")
         sys.exit(1)
 
     manifest = json.loads(manifest_path.read_text())
     ciphertext = enc_path.read_bytes()
-    key_partial = base64.b64decode(manifest["key_partial_b64"])
-    nonce = base64.b64decode(manifest["nonce_b64"])
-    aad = base64.b64decode(manifest["aad_b64"])
-
-    if keyfrag_path.is_file():
-        key_fragment = keyfrag_path.read_bytes()
-    else:
-        console.print(f"[yellow]No keyfrag at {keyfrag_path}; using zero fragment for demo[/yellow]")
-        key_fragment = b"\x00" * 4
-
-    km = KeyMaterial(key_partial=key_partial, key_fragment=key_fragment)
-    plaintext = decrypt_artifact(ciphertext, km.key_full, nonce, aad)
-    expected = manifest["plaintext_sha256"]
-    if hashlib.sha256(plaintext).hexdigest() != expected:
-        console.print("[red]Video SHA-256 mismatch — re-run encrypt_video.py[/red]")
-        sys.exit(1)
-    return plaintext
+    filename = manifest.get("source_filename", "video.enc")
+    return ciphertext, filename
 
 
 def make_handler(registry: AuthRegistry, video_bytes: bytes, filename: str):
@@ -130,21 +108,21 @@ def make_handler(registry: AuthRegistry, video_bytes: bytes, filename: str):
                 return
 
             if self.path == "/video/stream":
-                if not registry.is_authorized(client_ip):
-                    body = b'{"error":"knock required - send ICMP knock from this IP first"}'
-                    self.send_response(403)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
+                # Always serves the encrypted blob — anyone can download it.
+                # Without the key fragment (delivered only via ICMP knock reply),
+                # the ciphertext cannot be decrypted.
+                enc_filename = filename.rsplit(".", 1)[0] + ".enc"
                 self.send_response(200)
-                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(len(video_bytes)))
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Disposition", f'attachment; filename="{enc_filename}"')
                 self.end_headers()
                 self.wfile.write(video_bytes)
-                console.print(f"[green]Video sent to {client_ip} ({len(video_bytes)} bytes)[/green]")
+                authorized = registry.is_authorized(client_ip)
+                console.print(
+                    f"[green]Encrypted video sent to {client_ip} ({len(video_bytes)} bytes)"
+                    f"{'  [authorized — key fragment already sent via ICMP]' if authorized else '  [NOT authorized — no key fragment]'}[/green]"
+                )
                 return
 
             self.send_response(404)
@@ -225,9 +203,7 @@ def main() -> None:
     cfg = load_config(args.config)
 
     registry = AuthRegistry(ttl_seconds=cfg.auth.ttl_auth_seconds)
-    manifest = json.loads((ROOT / cfg.video.artifact_manifest).read_text())
-    video_name = manifest.get("source_filename", "video.mp4")
-    video_bytes = load_decrypted_video(cfg)
+    video_bytes, video_name = load_encrypted_video(cfg)
 
     port = cfg.server.video_port
     bind_ip = "0.0.0.0"
