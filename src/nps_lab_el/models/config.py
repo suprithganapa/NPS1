@@ -45,6 +45,12 @@ class DrmConfig(BaseModel):
 class ServerConfig(BaseModel):
     ip: str
     iface: str = "eth0"
+    video_port: int = 8765
+
+
+class ClientConfig(BaseModel):
+    ip: str = "127.0.0.1"
+    control_port: int = 8766
 
 
 class AuthConfig(BaseModel):
@@ -61,12 +67,21 @@ class FirewallConfig(BaseModel):
     mode: Literal["log_only", "iptables", "netsh"] = "log_only"
 
 
+class VideoConfig(BaseModel):
+    enabled: bool = True
+    artifact_enc: str = "artifacts/sample_video.enc"
+    artifact_manifest: str = "artifacts/sample_video.manifest.json"
+    keyfrag: str = "server_secrets/sample_video.keyfrag"
+
+
 class AppConfig(BaseModel):
     server: ServerConfig
     auth: AuthConfig
     channels: ChannelsConfig
+    client: ClientConfig = Field(default_factory=ClientConfig)
     fec: FecConfig = Field(default_factory=FecConfig)
     drm: DrmConfig = Field(default_factory=DrmConfig)
+    video: VideoConfig = Field(default_factory=VideoConfig)
     targets: TargetsConfig = Field(default_factory=TargetsConfig)
     firewall: FirewallConfig = Field(default_factory=FirewallConfig)
 

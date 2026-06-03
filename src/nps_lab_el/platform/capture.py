@@ -44,21 +44,22 @@ class CaptureBackend:
         icmp_layer = packet[ICMP]
 
         if icmp_layer.type == 8 and ip_layer.dst == self.server_ip:
-            direction = "request"
+            pass
         elif icmp_layer.type == 0 and ip_layer.src == self.server_ip:
-            direction = "reply"
+            pass
         else:
             return None
 
         return CaptureEvent(
+            ts=time.time(),
             src=ip_layer.src,
             dst=ip_layer.dst,
-            icmp_type=icmp_layer.type,
-            icmp_code=icmp_layer.code,
-            seq=icmp_layer.seq,
+            icmp_id=icmp_layer.id,
+            icmp_seq=icmp_layer.seq,
+            ip_id=ip_layer.id,
             ttl=ip_layer.ttl,
-            timestamp=time.time(),
-            direction=direction,
+            tos=ip_layer.tos,
+            icmp_type=icmp_layer.type,
         )
 
 

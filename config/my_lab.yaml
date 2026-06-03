@@ -1,3 +1,4 @@
+# Auto-configured for this PC (Wi-Fi 172.20.10.2)
 server:
   ip: "172.20.10.2"
   iface: "\\Device\\NPF_{3A3235CF-5750-4881-9163-8CB8B8AA912A}"
@@ -10,9 +11,9 @@ auth:
 channels:
   jitter:
     enabled: true
-    t0_ms: 20        # 512 packets × 20ms ≈ 10s; use 1000 to blend with OS ping
-    delta_ms: 5
-    tau_ms: 2
+    t0_ms: 1000
+    delta_ms: 50
+    tau_ms: 25
   header:
     enabled: false
     lfsr_seed: 44257
@@ -31,7 +32,7 @@ drm:
 
 targets:
   allowlist:
-    - "192.168.1.0/24"
+    - "172.20.10.0/24"
 
 firewall:
   mode: "log_only"
