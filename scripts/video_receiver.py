@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -275,6 +276,36 @@ def decrypt_segment(ciphertext: bytes, key: bytes, nonce: bytes, aad: bytes) -> 
     except Exception:
         console.print("[red]Segment decryption failed — wrong key or corrupted data[/red]")
         sys.exit(1)
+
+
+def _start_player(fmt_hint: str) -> "subprocess.Popen | None":
+    """Launch a media player that reads raw video bytes from stdin.
+
+    Tries ffplay (bundled with ffmpeg), then mpv, then vlc.
+    Returns None and prints a warning if none are found.
+    """
+    # ffplay: force format from the file extension hint so it doesn't need to seek
+    ext = fmt_hint.lstrip(".").lower() or "avi"
+    candidates: list[list[str]] = [
+        ["ffplay", "-autoexit", "-loglevel", "warning", "-f", ext, "pipe:0"],
+        ["ffplay", "-autoexit", "-loglevel", "warning", "pipe:0"],
+        ["mpv", "--demuxer-readahead-secs=10", "--force-seekable=no", "-"],
+        ["vlc", "--play-and-exit", "-"],
+    ]
+    for cmd in candidates:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            console.print(f"[cyan]Player started: {cmd[0]}[/cyan]")
+            return proc
+        except FileNotFoundError:
+            continue
+    console.print("[yellow]No media player found — install ffplay (ffmpeg), mpv, or vlc[/yellow]")
+    return None
 
 
 def fetch_key_fragment_http(http_host: str, video_port: int) -> bytes | None:
@@ -578,74 +609,93 @@ def main() -> None:
         # Server derives nonce for subsequent key packets from the first 2 bytes of the token
         subsequent_nonce = (int(current_token[:4], 16) & 0xFFFF) if current_token else 0
 
-        plaintext_parts: list[bytes] = []
         current_key = seg0_key
         # On same-host loopback the server sends ICMP from/to 127.0.0.1 so the
         # packet flows through \Device\NPF_Loopback.  Pass "127.0.0.1" as the
         # knock_target so _reply_sources() includes it in the allowed-source set.
         sniff_knock_target = "127.0.0.1" if sniff_iface else server_ip
 
-        for seg_idx in range(seg_count):
-            seg_meta = _manifest_data["segments"][seg_idx]
-            nonce = _b64.b64decode(seg_meta["nonce_b64"])
-            expected_sha = seg_meta["plaintext_sha256"]
+        # Start the media player now so it's ready to receive the first bytes.
+        # Decrypted bytes are piped directly to stdin — never written to disk.
+        out_ext = Path(args.output).suffix or ".avi"
+        player_proc = _start_player(out_ext) if not args.simulation else None
+        total_hash = hashlib.sha256()
 
-            # Start sniffing for key N+1 BEFORE sending the HTTP request for
-            # segment N.  The server transmits the ICMP key packets synchronously
-            # before writing the HTTP response body, so the sniffer must be live
-            # before the HTTP request reaches the server.
-            next_key_result: list[bytes] = []
-            next_sniffer: threading.Thread | None = None
-            if not args.simulation and seg_idx + 1 < seg_count:
-                next_sniffer = threading.Thread(
-                    target=_sniff_for_full_key,
-                    args=(sniff_knock_target, server_ip, subsequent_nonce, next_key_result),
-                    kwargs={"iface": sniff_iface},
-                    daemon=True,
-                )
-                next_sniffer.start()
-                time.sleep(0.3)  # wait for scapy sniffer to fully initialise
+        try:
+            for seg_idx in range(seg_count):
+                seg_meta = _manifest_data["segments"][seg_idx]
+                nonce = _b64.b64decode(seg_meta["nonce_b64"])
+                expected_sha = seg_meta["plaintext_sha256"]
 
-            console.print(f"[bold]Fetching segment {seg_idx + 1}/{seg_count}[/bold]")
-            ciphertext, current_token, is_last = fetch_segment(http_host, video_port, seg_idx, current_token)
+                # Start sniffing for key N+1 BEFORE sending the HTTP request for
+                # segment N.  The server transmits the ICMP key packets synchronously
+                # before writing the HTTP response body, so the sniffer must be live
+                # before the HTTP request reaches the server.
+                next_key_result: list[bytes] = []
+                next_sniffer: threading.Thread | None = None
+                if not args.simulation and seg_idx + 1 < seg_count:
+                    next_sniffer = threading.Thread(
+                        target=_sniff_for_full_key,
+                        args=(sniff_knock_target, server_ip, subsequent_nonce, next_key_result),
+                        kwargs={"iface": sniff_iface},
+                        daemon=True,
+                    )
+                    next_sniffer.start()
+                    time.sleep(0.3)  # wait for scapy sniffer to fully initialise
 
-            if current_key is None:
-                console.print(f"[yellow]Simulation: no key for segment {seg_idx}, skipping decrypt[/yellow]")
-                continue
+                console.print(f"[bold]Fetching segment {seg_idx + 1}/{seg_count}[/bold]")
+                ciphertext, current_token, is_last = fetch_segment(http_host, video_port, seg_idx, current_token)
 
-            plaintext = decrypt_segment(ciphertext, current_key, nonce, aad)
-            actual_sha = hashlib.sha256(plaintext).hexdigest()
-            if actual_sha != expected_sha:
-                console.print(f"[red]SHA-256 mismatch on segment {seg_idx}[/red]")
-                sys.exit(1)
-            plaintext_parts.append(plaintext)
-            console.print(f"[green]Segment {seg_idx} decrypted and verified ({len(plaintext)} bytes)[/green]")
-
-            # Wait for the next segment's key (sniffer started before the fetch)
-            if next_sniffer is not None:
-                next_sniffer.join(timeout=30)
-                if next_key_result:
-                    current_key = next_key_result[0]
-                    console.print(f"[green]Key for segment {seg_idx + 1} received[/green]")
+                if current_key is None:
+                    console.print(f"[yellow]Simulation: no key for segment {seg_idx}, skipping[/yellow]")
                 else:
-                    console.print(f"[red]No key received for segment {seg_idx + 1} — aborting[/red]")
-                    sys.exit(1)
+                    plaintext = decrypt_segment(ciphertext, current_key, nonce, aad)
+                    actual_sha = hashlib.sha256(plaintext).hexdigest()
+                    if actual_sha != expected_sha:
+                        console.print(f"[red]SHA-256 mismatch on segment {seg_idx} — aborting[/red]")
+                        sys.exit(1)
+                    total_hash.update(plaintext)
+                    console.print(f"[green]Segment {seg_idx} decrypted and verified ({len(plaintext)} bytes)[/green]")
 
-            if is_last:
-                break
+                    # Stream to player stdin — never stored on disk
+                    if player_proc is not None and player_proc.stdin:
+                        try:
+                            player_proc.stdin.write(plaintext)
+                            player_proc.stdin.flush()
+                        except BrokenPipeError:
+                            console.print("[yellow]Player closed early[/yellow]")
+                            player_proc = None
 
-        if plaintext_parts:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            video_bytes = b"".join(plaintext_parts)
-            out_path.write_bytes(video_bytes)
-            total_sha = hashlib.sha256(video_bytes).hexdigest()
-            expected_total = _manifest_data.get("total_plaintext_sha256")
-            if expected_total and total_sha == expected_total:
-                console.print(f"[bold green]Video reassembled and verified: {out_path}[/bold green]")
+                    # Overwrite plaintext in memory before releasing
+                    plaintext = bytes(len(plaintext))
+                    del plaintext
+
+                # Wait for the next segment's key (sniffer started before the fetch)
+                if next_sniffer is not None:
+                    next_sniffer.join(timeout=30)
+                    if next_key_result:
+                        current_key = next_key_result[0]
+                        console.print(f"[green]Key for segment {seg_idx + 1} received[/green]")
+                    else:
+                        console.print(f"[red]No key received for segment {seg_idx + 1} — aborting[/red]")
+                        sys.exit(1)
+
+                if is_last:
+                    break
+        finally:
+            if player_proc is not None and player_proc.stdin:
+                player_proc.stdin.close()
+            if player_proc is not None:
+                player_proc.wait()
+
+        expected_total = _manifest_data.get("total_plaintext_sha256")
+        if expected_total:
+            if total_hash.hexdigest() == expected_total:
+                console.print("[bold green]Stream complete — all segments verified[/bold green]")
             else:
-                console.print(f"[bold green]Video saved: {out_path}[/bold green]  [yellow](total SHA mismatch)[/yellow]")
+                console.print("[red]Total stream SHA-256 mismatch — video may be corrupt[/red]")
         else:
-            console.print("[yellow]No segments decrypted (simulation mode)[/yellow]")
+            console.print("[bold green]Stream complete[/bold green]")
         return
 
     # -----------------------------------------------------------------------
