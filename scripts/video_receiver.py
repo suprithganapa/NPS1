@@ -580,26 +580,31 @@ def main() -> None:
 
         plaintext_parts: list[bytes] = []
         current_key = seg0_key
+        # On same-host loopback the server sends ICMP from/to 127.0.0.1 so the
+        # packet flows through \Device\NPF_Loopback.  Pass "127.0.0.1" as the
+        # knock_target so _reply_sources() includes it in the allowed-source set.
+        sniff_knock_target = "127.0.0.1" if sniff_iface else server_ip
 
         for seg_idx in range(seg_count):
             seg_meta = _manifest_data["segments"][seg_idx]
             nonce = _b64.b64decode(seg_meta["nonce_b64"])
             expected_sha = seg_meta["plaintext_sha256"]
 
-            # Start sniffer for the NEXT key BEFORE fetching this segment.
-            # The server sends key N+1 as soon as it responds to the segment N
-            # request, so the sniffer must already be running at that moment.
+            # Start sniffing for key N+1 BEFORE sending the HTTP request for
+            # segment N.  The server transmits the ICMP key packets synchronously
+            # before writing the HTTP response body, so the sniffer must be live
+            # before the HTTP request reaches the server.
             next_key_result: list[bytes] = []
             next_sniffer: threading.Thread | None = None
             if not args.simulation and seg_idx + 1 < seg_count:
                 next_sniffer = threading.Thread(
                     target=_sniff_for_full_key,
-                    args=(server_ip, server_ip, subsequent_nonce, next_key_result),
+                    args=(sniff_knock_target, server_ip, subsequent_nonce, next_key_result),
                     kwargs={"iface": sniff_iface},
                     daemon=True,
                 )
                 next_sniffer.start()
-                time.sleep(0.15)  # let the sniffer initialise before we trigger the HTTP fetch
+                time.sleep(0.3)  # wait for scapy sniffer to fully initialise
 
             console.print(f"[bold]Fetching segment {seg_idx + 1}/{seg_count}[/bold]")
             ciphertext, current_token, is_last = fetch_segment(http_host, video_port, seg_idx, current_token)

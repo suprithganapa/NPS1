@@ -375,21 +375,26 @@ def make_handler(
                 entry.advance()
                 is_last = entry.next_segment >= len(segs)
 
-                # Deliver next segment's key via 8 ICMP replies (non-blocking)
+                # Deliver next segment's key via 8 ICMP replies BEFORE sending the
+                # HTTP response body.  The client starts sniffing, then fires the HTTP
+                # request; the server must transmit the ICMP packets while the client
+                # is still in the sniff window — i.e. before the HTTP response arrives.
                 if cfg is not None and segment_keys is not None and not getattr(cfg, '_simulation', False):
                     next_idx = entry.next_segment  # already advanced
                     if next_idx < len(segment_keys):
                         from nps_lab_el.services.drm_responder import DrmResponder
+                        from scapy.all import send as scapy_send
                         session_nonce = int(token[:4], 16) & 0xFFFF
-                        reply_src = "127.0.0.1" if client_ip in ("127.0.0.1", cfg.server.ip) else cfg.server.ip
+                        same_host = client_ip in ("127.0.0.1", cfg.server.ip)
+                        # On same-host, send to 127.0.0.1 so the packet flows through
+                        # \Device\NPF_Loopback (packets to the real IP go to real adapter)
+                        reply_src = "127.0.0.1" if same_host else cfg.server.ip
+                        reply_dst = "127.0.0.1" if same_host else client_ip
                         drm = DrmResponder(cfg)
-                        pkts = drm.build_reply_packets_full_key(reply_src, client_ip, segment_keys[next_idx], session_nonce)
-                        def _send_key_pkts(packets):
-                            from scapy.all import send as scapy_send
-                            for p in packets:
-                                scapy_send(p, verbose=False)
-                            console.print(f"[green]Seg {next_idx} key sent via 8 ICMP replies → {shown_ip}[/green]")
-                        threading.Thread(target=_send_key_pkts, args=(pkts,), daemon=True).start()
+                        pkts = drm.build_reply_packets_full_key(reply_src, reply_dst, segment_keys[next_idx], session_nonce)
+                        for p in pkts:
+                            scapy_send(p, verbose=False)
+                        console.print(f"[green]Seg {next_idx} key sent via 8 ICMP replies → {shown_ip}[/green]")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
