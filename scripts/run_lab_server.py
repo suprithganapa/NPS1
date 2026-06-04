@@ -11,7 +11,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import secrets as _secrets_mod
 import socket
 import sys
 import threading
@@ -117,6 +119,72 @@ def open_video_artifact(cfg) -> VideoArtifact:
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Segment DRM: session registry + segment key store
+# ---------------------------------------------------------------------------
+
+class _SessionEntry:
+    def __init__(self, client_ip: str, ttl: int, segment_count: int) -> None:
+        self.client_ip = client_ip
+        self.ttl = ttl
+        self.expires_at = time.time() + ttl
+        self.segment_count = segment_count
+        self.next_segment = 0
+        self.revoked = False
+
+    def is_valid(self) -> bool:
+        return not self.revoked and time.time() < self.expires_at
+
+    def touch(self) -> None:
+        self.expires_at = time.time() + self.ttl
+
+    def advance(self) -> None:
+        self.next_segment += 1
+        self.touch()
+
+
+class SegmentSessionRegistry:
+    """Maps session tokens → client sessions for segment-gated delivery."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, _SessionEntry] = {}
+        self._ip_to_token: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def create(self, client_ip: str, ttl: int, segment_count: int) -> str:
+        token = _secrets_mod.token_hex(32)
+        with self._lock:
+            self._sessions[token] = _SessionEntry(client_ip, ttl, segment_count)
+            self._ip_to_token[client_ip] = token
+        return token
+
+    def get(self, token: str) -> _SessionEntry | None:
+        with self._lock:
+            entry = self._sessions.get(token)
+            if entry and not entry.is_valid():
+                del self._sessions[token]
+                return None
+            return entry
+
+    def revoke_ip(self, ip: str) -> None:
+        with self._lock:
+            token = self._ip_to_token.get(ip)
+            if token and token in self._sessions:
+                self._sessions[token].revoked = True
+
+
+def load_segment_keys(cfg, stem: str) -> list[bytes]:
+    segkeys_path = ROOT / cfg.video.segkeys
+    # Fall back to deriving path from stem if config default wasn't updated
+    if not Path(segkeys_path).is_file():
+        segkeys_path = ROOT / "server_secrets" / f"{stem}.segkeys"
+    if not Path(segkeys_path).is_file():
+        console.print(f"[red]Missing segment keys: {segkeys_path}[/red]")
+        console.print("Run: python scripts/encrypt_video.py <video.mp4>")
+        sys.exit(1)
+    return [base64.b64decode(line.strip()) for line in Path(segkeys_path).read_text().splitlines() if line.strip()]
+
+
 class LabHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
@@ -172,6 +240,10 @@ def make_handler(
     keyfrag_path: Path,
     *,
     log_client_ip=None,
+    seg_registry: "SegmentSessionRegistry | None" = None,
+    segment_keys: "list[bytes] | None" = None,
+    manifest: "dict | None" = None,
+    cfg=None,
 ):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
@@ -246,14 +318,89 @@ def make_handler(
                 )
                 return
 
+            # --- Segment DRM: GET /video/segment/<N> ---
+            if self.path.startswith("/video/segment/") and seg_registry is not None:
+                try:
+                    seg_idx = int(self.path.split("/")[-1])
+                except ValueError:
+                    self._json(400, {"error": "invalid segment index"})
+                    return
+
+                segs = manifest.get("segments", []) if manifest else []
+                if seg_idx < 0 or seg_idx >= len(segs):
+                    self._json(404, {"error": "segment not found"})
+                    return
+
+                token = self.headers.get("X-Session-Token", "")
+                entry = seg_registry.get(token)
+                if entry is None:
+                    self._json(403, {"error": "invalid or expired session — complete ICMP knock first"})
+                    return
+                if entry.client_ip != client_ip:
+                    self._json(403, {"error": "session token bound to different IP"})
+                    return
+                if seg_idx != entry.next_segment:
+                    self._json(409, {"error": f"out of order — expected segment {entry.next_segment}"})
+                    return
+
+                seg_meta = segs[seg_idx]
+                seg_path = ROOT / "artifacts" / seg_meta["file"]
+                if not seg_path.is_file():
+                    self._json(500, {"error": "segment file missing on server"})
+                    return
+
+                seg_data = seg_path.read_bytes()
+                entry.advance()
+                is_last = entry.next_segment >= len(segs)
+
+                # Deliver next segment's key via 8 ICMP replies (non-blocking)
+                if cfg is not None and segment_keys is not None and not getattr(cfg, '_simulation', False):
+                    next_idx = entry.next_segment  # already advanced
+                    if next_idx < len(segment_keys):
+                        from nps_lab_el.services.drm_responder import DrmResponder
+                        session_nonce = int(token[:4], 16) & 0xFFFF
+                        reply_src = "127.0.0.1" if client_ip in ("127.0.0.1", cfg.server.ip) else cfg.server.ip
+                        drm = DrmResponder(cfg)
+                        pkts = drm.build_reply_packets_full_key(reply_src, client_ip, segment_keys[next_idx], session_nonce)
+                        def _send_key_pkts(packets):
+                            from scapy.all import send as scapy_send
+                            for p in packets:
+                                scapy_send(p, verbose=False)
+                            console.print(f"[green]Seg {next_idx} key sent via 8 ICMP replies → {shown_ip}[/green]")
+                        threading.Thread(target=_send_key_pkts, args=(pkts,), daemon=True).start()
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(seg_data)))
+                self.send_header("X-Segment-Index", str(seg_idx))
+                self.send_header("X-Segment-Count", str(len(segs)))
+                self.send_header("X-Session-Token", token)
+                self.send_header("X-Last-Segment", "true" if is_last else "false")
+                self.end_headers()
+                self.wfile.write(seg_data)
+                console.print(f"[green]Segment {seg_idx}/{len(segs)-1} → {shown_ip} ({len(seg_data)} bytes){'  [last]' if is_last else ''}[/green]")
+                if is_last:
+                    entry.revoked = True
+                return
+
             self.send_response(404)
             self.end_headers()
+
+        def _json(self, code: int, body: dict) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
     return Handler
 
 
 def run_sniffer(
-    cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str, config_path: Path
+    cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str, config_path: Path,
+    seg_registry: "SegmentSessionRegistry | None" = None,
+    segment_keys: "list[bytes] | None" = None,
 ) -> None:
     from nps_lab_el.models.auth import AuthorizationState, CaptureEvent
     from nps_lab_el.platform.capture import CaptureBackend, SimulationCapture
@@ -367,25 +514,39 @@ def run_sniffer(
             if drm is not None and not capture.simulation:
                 from scapy.all import send as scapy_send
 
-                keyfrag_path = ROOT / cfg.video.keyfrag
-                if keyfrag_path.is_file():
-                    fragment = keyfrag_path.read_bytes()
-                    if len(fragment) != 4:
-                        console.print(f"[red]Key fragment must be 4 bytes: {keyfrag_path}[/red]")
-                        return
-                else:
-                    fragment = drm.compute_fragment(session)
                 knock_events = [e for e in events if e.icmp_type == 8]
                 session_nonce = knock_events[0].icmp_id if knock_events else 0
                 reply_src = "127.0.0.1" if src_ip in ("127.0.0.1", cfg.server.ip) else cfg.server.ip
-                reply = drm.build_reply_packet(
-                    src_ip=reply_src,
-                    dst_ip=src_ip,
-                    fragment=fragment,
-                    session_nonce=session_nonce,
-                )
-                scapy_send(reply, verbose=False)
-                console.print(f"[green]DRM ICMP reply sent to {shown_src}[/green]")
+
+                # Segment DRM: create session token and deliver segment 0 key via 8 ICMP replies
+                if seg_registry is not None and segment_keys:
+                    seg_count = len(segment_keys)
+                    token = seg_registry.create(src_ip, cfg.video.session_ttl_seconds, seg_count)
+                    # Also authorize the loopback alias so HTTP requests work on same host
+                    seg_registry.create("127.0.0.1", cfg.video.session_ttl_seconds, seg_count)
+                    console.print(f"[green]Session created for {shown_src}  token={token[:8]}…[/green]")
+                    pkts = drm.build_reply_packets_full_key(reply_src, src_ip, segment_keys[0], session_nonce)
+                    for p in pkts:
+                        scapy_send(p, verbose=False)
+                    console.print(f"[green]Segment 0 key sent via 8 ICMP replies → {shown_src}[/green]")
+                else:
+                    # Legacy single-file mode: send 4-byte key fragment
+                    keyfrag_path = ROOT / cfg.video.keyfrag
+                    if keyfrag_path.is_file():
+                        fragment = keyfrag_path.read_bytes()
+                        if len(fragment) != 4:
+                            console.print(f"[red]Key fragment must be 4 bytes: {keyfrag_path}[/red]")
+                            return
+                    else:
+                        fragment = drm.compute_fragment(session)
+                    reply = drm.build_reply_packet(
+                        src_ip=reply_src,
+                        dst_ip=src_ip,
+                        fragment=fragment,
+                        session_nonce=session_nonce,
+                    )
+                    scapy_send(reply, verbose=False)
+                    console.print(f"[green]DRM ICMP reply sent to {shown_src}[/green]")
 
     def callback(packet) -> None:
         event = capture.parse_packet(packet)
@@ -452,6 +613,20 @@ def main() -> None:
     registry = AuthRegistry(ttl_seconds=cfg.auth.ttl_auth_seconds)
     video = open_video_artifact(cfg)
 
+    # Load segment keys if available (segment DRM mode)
+    manifest = json.loads((ROOT / cfg.video.artifact_manifest).read_text()) if (ROOT / cfg.video.artifact_manifest).is_file() else {}
+    stem = Path(manifest.get("source_filename", "sample_video")).stem
+    segment_keys: list[bytes] | None = None
+    seg_registry: SegmentSessionRegistry | None = None
+    if manifest.get("segment_count"):
+        segment_keys = load_segment_keys(cfg, stem)
+        seg_registry = SegmentSessionRegistry()
+        console.print(f"[green]Segment DRM: {len(segment_keys)} segment keys loaded[/green]")
+        if args.simulation and seg_registry is not None:
+            # Pre-create a simulation session so the client can fetch segments without knock
+            sim_token = seg_registry.create("127.0.0.1", cfg.video.session_ttl_seconds, len(segment_keys))
+            console.print(f"[cyan]Simulation session token: {sim_token}[/cyan]")
+
     port = cfg.server.video_port
     ensure_port_available(port)
     bind_ip = "0.0.0.0"
@@ -464,7 +639,12 @@ def main() -> None:
         cfg_client_ip=cfg.client.ip,
     )
     handler = make_handler(
-        registry, video, ROOT / cfg.video.keyfrag, log_client_ip=log_client_ip
+        registry, video, ROOT / cfg.video.keyfrag,
+        log_client_ip=log_client_ip,
+        seg_registry=seg_registry,
+        segment_keys=segment_keys,
+        manifest=manifest,
+        cfg=cfg,
     )
     httpd = LabHTTPServer((bind_ip, port), handler)
     httpd_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -479,12 +659,15 @@ def main() -> None:
     console.print(f"[bold green]Video server ready on port {port}[/bold green]")
     console.print(f"[bold green]  http://{health_host}:{port}/health[/bold green]")
     console.print(f"[bold green]  http://{cfg.server.ip}:{port}/video/stream[/bold green]")
+    if seg_registry is not None:
+        console.print(f"[bold green]  http://{cfg.server.ip}:{port}/video/segment/<N>[/bold green]")
     console.print(f"[dim]Encrypted artifact: {video.filename} ({video.size} bytes)[/dim]")
 
     if not args.http_only:
         sniffer_thread = threading.Thread(
             target=run_sniffer,
             args=(cfg, registry, args.simulation, cfg.client.ip, cfg_path),
+            kwargs={"seg_registry": seg_registry, "segment_keys": segment_keys},
             daemon=True,
         )
         sniffer_thread.start()

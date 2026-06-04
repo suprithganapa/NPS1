@@ -73,56 +73,50 @@ def _reply_sources(knock_target: str, server_ip: str) -> set[str]:
     return sources
 
 
-def _sniff_for_fragment(
+def _sniff_for_full_key(
     knock_target: str,
     server_ip: str,
     session_nonce: int,
-    stop_event: threading.Event,
     result: list[bytes],
     iface: str | None = None,
 ) -> None:
+    """Collect 8 DRM ICMP reply packets and reassemble the 32-byte segment key."""
     from scapy.all import ICMP, IP, sniff
-
-    from nps_lab_el.services.drm_responder import DrmResponder
+    from nps_lab_el.services.drm_responder import DRM_ICMP_CODE, FULL_KEY_REPLY_PACKETS, DrmResponder
 
     allowed_src = _reply_sources(knock_target, server_ip)
+    collected: list = []
 
     def _on_reply(pkt) -> None:
         if not pkt.haslayer(IP) or not pkt.haslayer(ICMP) or pkt[ICMP].type != 0:
             return
-        from nps_lab_el.services.drm_responder import DRM_ICMP_CODE
-
-        # Lab DRM reply: seq=0 and code=0x5A; OS replies use code 0 and often ttl=128.
-        if pkt[ICMP].seq != 0 or pkt[ICMP].code != DRM_ICMP_CODE:
-            return
-        if pkt.ttl == 128 and pkt.tos == 0:
+        if pkt[ICMP].code != DRM_ICMP_CODE:
             return
         if pkt[IP].src not in allowed_src:
             return
-        try:
-            fragment = DrmResponder.extract_key_fragment(
-                reply_ttl=pkt.ttl,
-                reply_tos=pkt.tos,
-                reply_icmp_id=pkt[ICMP].id,
-                session_nonce=session_nonce,
-            )
-        except Exception:
-            return
-        if len(fragment) != 4:
-            return
-        result.append(fragment)
-        stop_event.set()
+        collected.append(pkt)
+        if len(collected) >= FULL_KEY_REPLY_PACKETS:
+            key = DrmResponder.extract_full_key_from_replies(collected, session_nonce)
+            if key is not None:
+                result.append(key)
 
     sniff_kwargs: dict = {
         "filter": "icmp",
         "prn": _on_reply,
-        "store": 0,
-        "stop_filter": lambda _: stop_event.is_set(),
+        "store": 1,
+        "stop_filter": lambda _: bool(result),
         "timeout": 45,
+        "count": FULL_KEY_REPLY_PACKETS * 2,  # collect up to 2× in case of duplicates
     }
     if iface:
         sniff_kwargs["iface"] = iface
     sniff(**sniff_kwargs)
+    # Final attempt to assemble from whatever arrived
+    if not result and collected:
+        from nps_lab_el.services.drm_responder import DrmResponder
+        key = DrmResponder.extract_full_key_from_replies(collected, session_nonce)
+        if key is not None:
+            result.append(key)
 
 
 def _build_auth_token(cfg, channel_mask: int) -> "AuthToken":
@@ -137,7 +131,7 @@ def _build_auth_token(cfg, channel_mask: int) -> "AuthToken":
 
 
 def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
-    """Send ICMP knock and return the 4-byte key fragment from the server reply, or None on simulation."""
+    """Send ICMP knock and return the 32-byte segment 0 key from 8 ICMP replies, or None on simulation."""
     from nps_lab_el.platform.permissions import require_privileges
     from nps_lab_el.protocol.encode_jitter import encode_with_fec
 
@@ -214,12 +208,11 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
     from scapy.all import ICMP, IP, send
 
     session_nonce = int.from_bytes(os.urandom(2), "big")
-    stop_sniff = threading.Event()
-    fragment_result: list[bytes] = []
+    key_result: list[bytes] = []
     sniff_iface = r"\Device\NPF_Loopback" if sys.platform == "win32" and knock_target == "127.0.0.1" else None
     sniffer = threading.Thread(
-        target=_sniff_for_fragment,
-        args=(knock_target, server_ip, session_nonce, stop_sniff, fragment_result),
+        target=_sniff_for_full_key,
+        args=(knock_target, server_ip, session_nonce, key_result),
         kwargs={"iface": sniff_iface},
         daemon=True,
     )
@@ -243,19 +236,64 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
                 pct = 100 * (i + 1) // total
                 console.print(f"[dim]  knock progress: {i + 1}/{total} gaps ({pct}%)[/dim]")
 
-    console.print("[green]Knock sent — waiting for server ICMP reply (key fragment)...[/green]")
+    console.print("[green]Knock sent — waiting for 8 ICMP replies (32-byte segment key)...[/green]")
     console.print("[dim]  server needs ~2s after last packet to authorize[/dim]")
-    sniffer.join(timeout=45)
+    sniffer.join(timeout=60)
 
-    if fragment_result:
-        key_fragment = fragment_result[0]
-        console.print(f"[green]Key fragment received ({key_fragment.hex()})[/green]")
-        return key_fragment
+    if key_result:
+        seg0_key = key_result[0]
+        console.print(f"[green]Segment 0 key received ({seg0_key.hex()[:16]}…)[/green]")
+        return seg0_key
 
-    console.print("[red]No ICMP reply with key fragment — knock failed or server not sniffing[/red]")
+    console.print("[red]No full-key ICMP replies received — knock failed or server not sniffing[/red]")
     console.print("[yellow]Check:[/yellow] server Admin? sniffer shows AUTHORIZED? same TOTP in both YAMLs?")
     console.print("[yellow]  t0_ms should be 20 (not 1000) — re-run generate_lab_configs.py[/yellow]")
     return None
+
+
+def _sniff_for_segment_key(
+    server_ip: str,
+    session_nonce: int,
+    iface: str | None = None,
+    timeout: int = 30,
+) -> bytes | None:
+    """Collect 8 ICMP replies for a subsequent segment key (called before fetching each segment)."""
+    from nps_lab_el.services.drm_responder import FULL_KEY_REPLY_PACKETS
+    result: list[bytes] = []
+    knock_target = server_ip  # replies come from server
+    _sniff_for_full_key(knock_target, server_ip, session_nonce, result, iface=iface)
+    return result[0] if result else None
+
+
+def fetch_segment(
+    http_host: str, video_port: int, seg_idx: int, session_token: str
+) -> tuple[bytes, str, bool]:
+    """Download one encrypted segment. Returns (ciphertext, updated_token, is_last)."""
+    url = f"http://{http_host}:{video_port}/video/segment/{seg_idx}"
+    req = urllib.request.Request(url)
+    req.add_header("X-Session-Token", session_token)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+            new_token = resp.headers.get("X-Session-Token", session_token)
+            is_last = resp.headers.get("X-Last-Segment", "false").lower() == "true"
+        return data, new_token, is_last
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        console.print(f"[red]HTTP {exc.code} on segment {seg_idx}: {body}[/red]")
+        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError) as exc:
+        console.print(f"[red]Cannot reach server for segment {seg_idx}: {exc}[/red]")
+        sys.exit(1)
+
+
+def decrypt_segment(ciphertext: bytes, key: bytes, nonce: bytes, aad: bytes) -> bytes:
+    from nps_lab_el.crypto.aes_gcm import decrypt_artifact
+    try:
+        return decrypt_artifact(ciphertext, key, nonce, aad)
+    except Exception:
+        console.print("[red]Segment decryption failed — wrong key or corrupted data[/red]")
+        sys.exit(1)
 
 
 def fetch_key_fragment_http(http_host: str, video_port: int) -> bytes | None:
@@ -483,21 +521,27 @@ def main() -> None:
         cfg_client_ip=cfg.client.ip,
     )
 
-    key_fragment: bytes | None = None
+    # Determine mode: segment DRM (new) vs single-file (legacy)
+    import json as _json
+    _manifest_data = _json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    _segment_mode = bool(_manifest_data.get("segment_count"))
+
+    seg0_key: bytes | None = None
+    session_token: str = ""
 
     if args.skip_knock:
         if args.key_fragment:
-            key_fragment = bytes.fromhex(args.key_fragment)
+            seg0_key = bytes.fromhex(args.key_fragment)
         else:
             console.print("[red]--skip-knock requires --key-fragment <hex>[/red]")
             sys.exit(1)
     else:
-        key_fragment = send_knock(cfg, server_ip=server_ip, simulation=args.simulation)
-        if key_fragment is None and not args.simulation:
-            console.print("[yellow]No DRM ICMP reply — waiting for server, then trying HTTP…[/yellow]")
+        seg0_key = send_knock(cfg, server_ip=server_ip, simulation=args.simulation)
+        if seg0_key is None and not args.simulation:
+            console.print("[yellow]No DRM ICMP replies — waiting for server, then trying HTTP…[/yellow]")
             time.sleep(4)
-            key_fragment = fetch_key_fragment_http(http_host, video_port)
-            if key_fragment is None:
+            http_fragment = fetch_key_fragment_http(http_host, video_port)
+            if http_fragment is None:
                 if peer_cfg is not None and cfg.auth.totp_secret != peer_cfg.auth.totp_secret:
                     console.print(
                         f"[red]Knock denied — TOTP mismatch (knocker …{totp_tag(cfg.auth.totp_secret)} "
@@ -506,6 +550,76 @@ def main() -> None:
                 else:
                     console.print("[red]Knock did not authorize (check server log: AUTHORIZED vs DENIED).[/red]")
                 sys.exit(1)
+            seg0_key = http_fragment  # legacy 4-byte fallback
+
+    # -----------------------------------------------------------------------
+    # Segment DRM mode: download each segment, receive its key via ICMP, decrypt
+    # -----------------------------------------------------------------------
+    if _segment_mode:
+        if seg0_key is None and not args.simulation:
+            console.print("[red]No segment 0 key — cannot proceed[/red]")
+            sys.exit(1)
+
+        import base64 as _b64
+        aad = _b64.b64decode(_manifest_data["aad_b64"])
+        seg_count = _manifest_data["segment_count"]
+        sniff_iface = r"\Device\NPF_Loopback" if sys.platform == "win32" and server_ip == cfg.client.ip else None
+        session_nonce = int.from_bytes(os.urandom(2), "big") if not args.simulation else 0
+
+        plaintext_parts: list[bytes] = []
+        current_key = seg0_key
+        current_token = session_token
+
+        for seg_idx in range(seg_count):
+            seg_meta = _manifest_data["segments"][seg_idx]
+            nonce = _b64.b64decode(seg_meta["nonce_b64"])
+            expected_sha = seg_meta["plaintext_sha256"]
+
+            # For segments beyond 0, wait for next key via ICMP (server sends it alongside previous segment)
+            if seg_idx > 0 and not args.simulation:
+                console.print(f"[dim]Waiting for key for segment {seg_idx} via ICMP…[/dim]")
+                current_key = _sniff_for_segment_key(server_ip, session_nonce, iface=sniff_iface)
+                if current_key is None:
+                    console.print(f"[red]No key received for segment {seg_idx} — aborting[/red]")
+                    sys.exit(1)
+                console.print(f"[green]Key for segment {seg_idx} received[/green]")
+
+            console.print(f"[bold]Fetching segment {seg_idx + 1}/{seg_count}[/bold]")
+            ciphertext, current_token, is_last = fetch_segment(http_host, video_port, seg_idx, current_token)
+
+            if current_key is None:
+                console.print(f"[yellow]Simulation: no key for segment {seg_idx}, skipping decrypt[/yellow]")
+                continue
+
+            plaintext = decrypt_segment(ciphertext, current_key, nonce, aad)
+            actual_sha = hashlib.sha256(plaintext).hexdigest()
+            if actual_sha != expected_sha:
+                console.print(f"[red]SHA-256 mismatch on segment {seg_idx}[/red]")
+                sys.exit(1)
+            plaintext_parts.append(plaintext)
+            console.print(f"[green]Segment {seg_idx} decrypted and verified ({len(plaintext)} bytes)[/green]")
+
+            if is_last:
+                break
+
+        if plaintext_parts:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            video_bytes = b"".join(plaintext_parts)
+            out_path.write_bytes(video_bytes)
+            total_sha = hashlib.sha256(video_bytes).hexdigest()
+            expected_total = _manifest_data.get("total_plaintext_sha256")
+            if expected_total and total_sha == expected_total:
+                console.print(f"[bold green]Video reassembled and verified: {out_path}[/bold green]")
+            else:
+                console.print(f"[bold green]Video saved: {out_path}[/bold green]  [yellow](total SHA mismatch)[/yellow]")
+        else:
+            console.print("[yellow]No segments decrypted (simulation mode)[/yellow]")
+        return
+
+    # -----------------------------------------------------------------------
+    # Legacy single-file mode
+    # -----------------------------------------------------------------------
+    key_fragment = seg0_key
 
     # Download the encrypted blob (open to anyone — useless without the key fragment)
     fetch_encrypted_video(http_host, video_port, enc_path, display_host=http_display)

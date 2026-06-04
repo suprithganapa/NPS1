@@ -72,6 +72,9 @@ class VideoConfig(BaseModel):
     artifact_enc: str = "artifacts/sample_video.enc"
     artifact_manifest: str = "artifacts/sample_video.manifest.json"
     keyfrag: str = "server_secrets/sample_video.keyfrag"
+    segkeys: str = "server_secrets/sample_video.segkeys"
+    segment_size_bytes: int = 262144   # 256 KB; must match encrypt_video.py
+    session_ttl_seconds: int = 120     # how long a session token stays valid
 
 
 class AppConfig(BaseModel):
