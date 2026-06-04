@@ -75,6 +75,28 @@ NPS1/
 
 ---
 
+## Dashboard UI
+
+A single-page web dashboard lets you run all backend scripts without touching the terminal.
+
+```bash
+# Install dependencies first
+pip install -r requirements.txt
+
+# Start the dashboard (no root needed)
+python scripts/lab_ui.py
+# → Open http://localhost:8080 in your browser
+```
+
+Features:
+- **Encrypt** — pick an MP4, choose segment size, watch encryption progress live
+- **Server** — start/stop `run_lab_server.py` with simulation and HTTP-only toggles
+- **Client** — run `video_receiver.py`, visualize the knock → key → segments → reassemble flow
+- **Config** — generate `server.yaml` + `knocker.yaml` from IP inputs
+- **Live terminal** — color-coded WebSocket log stream from all subprocesses
+
+---
+
 ## Quick Start
 
 ### 1. Install dependencies
