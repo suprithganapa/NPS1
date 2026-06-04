@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-SEGMENT_SIZE = 262144  # 256 KB per segment
+SEGMENT_SIZE = 10 * 1024 * 1024  # 10 MB per segment (default)
 
 
 def encrypt_video(video_path: Path, segment_size: int = SEGMENT_SIZE) -> None:
@@ -92,13 +92,20 @@ def encrypt_video(video_path: Path, segment_size: int = SEGMENT_SIZE) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/encrypt_video.py <path/to/video.mp4>")
-        sys.exit(1)
+    import argparse as _ap
+    p = _ap.ArgumentParser()
+    p.add_argument("video", help="Path to video file")
+    p.add_argument(
+        "--segment-size",
+        type=int,
+        default=SEGMENT_SIZE,
+        help=f"Bytes per segment (default {SEGMENT_SIZE // 1024 // 1024} MB)",
+    )
+    a = p.parse_args()
 
-    video = Path(sys.argv[1])
+    video = Path(a.video)
     if not video.exists():
         print(f"File not found: {video}")
         sys.exit(1)
 
-    encrypt_video(video)
+    encrypt_video(video, segment_size=a.segment_size)

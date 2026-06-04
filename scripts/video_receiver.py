@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -657,12 +658,15 @@ def main() -> None:
                     total_hash.update(plaintext)
                     console.print(f"[green]Segment {seg_idx} decrypted and verified ({len(plaintext)} bytes)[/green]")
 
-                    # Stream to player stdin — never stored on disk
+                    # Stream to player stdin in 32 KB chunks — Windows pipe
+                    # buffers reject large single writes (OSError EINVAL)
                     if player_proc is not None and player_proc.stdin:
                         try:
-                            player_proc.stdin.write(plaintext)
+                            chunk_size = 32 * 1024
+                            for off in range(0, len(plaintext), chunk_size):
+                                player_proc.stdin.write(plaintext[off:off + chunk_size])
                             player_proc.stdin.flush()
-                        except BrokenPipeError:
+                        except (BrokenPipeError, OSError):
                             console.print("[yellow]Player closed early[/yellow]")
                             player_proc = None
 
