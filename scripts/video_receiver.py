@@ -246,20 +246,6 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
     return None
 
 
-def _sniff_for_segment_key(
-    server_ip: str,
-    session_nonce: int,
-    iface: str | None = None,
-    timeout: int = 30,
-) -> bytes | None:
-    """Collect 8 ICMP replies for a subsequent segment key (called before fetching each segment)."""
-    from nps_lab_el.services.drm_responder import FULL_KEY_REPLY_PACKETS
-    result: list[bytes] = []
-    knock_target = server_ip  # replies come from server
-    _sniff_for_full_key(knock_target, server_ip, session_nonce, result, iface=iface)
-    return result[0] if result else None
-
-
 def fetch_segment(
     http_host: str, video_port: int, seg_idx: int, session_token: str
 ) -> tuple[bytes, str, bool]:
@@ -600,14 +586,20 @@ def main() -> None:
             nonce = _b64.b64decode(seg_meta["nonce_b64"])
             expected_sha = seg_meta["plaintext_sha256"]
 
-            # For segments beyond 0, wait for next key via ICMP (server sends it alongside previous segment)
-            if seg_idx > 0 and not args.simulation:
-                console.print(f"[dim]Waiting for key for segment {seg_idx} via ICMP…[/dim]")
-                current_key = _sniff_for_segment_key(server_ip, subsequent_nonce, iface=sniff_iface)
-                if current_key is None:
-                    console.print(f"[red]No key received for segment {seg_idx} — aborting[/red]")
-                    sys.exit(1)
-                console.print(f"[green]Key for segment {seg_idx} received[/green]")
+            # Start sniffer for the NEXT key BEFORE fetching this segment.
+            # The server sends key N+1 as soon as it responds to the segment N
+            # request, so the sniffer must already be running at that moment.
+            next_key_result: list[bytes] = []
+            next_sniffer: threading.Thread | None = None
+            if not args.simulation and seg_idx + 1 < seg_count:
+                next_sniffer = threading.Thread(
+                    target=_sniff_for_full_key,
+                    args=(server_ip, server_ip, subsequent_nonce, next_key_result),
+                    kwargs={"iface": sniff_iface},
+                    daemon=True,
+                )
+                next_sniffer.start()
+                time.sleep(0.15)  # let the sniffer initialise before we trigger the HTTP fetch
 
             console.print(f"[bold]Fetching segment {seg_idx + 1}/{seg_count}[/bold]")
             ciphertext, current_token, is_last = fetch_segment(http_host, video_port, seg_idx, current_token)
@@ -623,6 +615,16 @@ def main() -> None:
                 sys.exit(1)
             plaintext_parts.append(plaintext)
             console.print(f"[green]Segment {seg_idx} decrypted and verified ({len(plaintext)} bytes)[/green]")
+
+            # Wait for the next segment's key (sniffer started before the fetch)
+            if next_sniffer is not None:
+                next_sniffer.join(timeout=30)
+                if next_key_result:
+                    current_key = next_key_result[0]
+                    console.print(f"[green]Key for segment {seg_idx + 1} received[/green]")
+                else:
+                    console.print(f"[red]No key received for segment {seg_idx + 1} — aborting[/red]")
+                    sys.exit(1)
 
             if is_last:
                 break
