@@ -1,0 +1,8 @@
+# IPs shown in terminal. Real knock uses config/generated/*.yaml.
+show_layout: false
+
+server_ip: 172.20.10.2
+knocker_client_ip: 172.20.10.2
+
+# Same host: set knocker_client_ip equal to server_ip
+# Different: set knocker_client_ip to another address (e.g. 172.20.10.1)

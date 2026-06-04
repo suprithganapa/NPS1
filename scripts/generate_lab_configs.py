@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "config" / "generated"
 DEFAULT_TOTP = "JBSWY3DPEHPK3PXP"
 
+sys.path.insert(0, str(ROOT / "scripts"))
+from lab_config_common import print_test_matrix, video_block_for_stem  # noqa: E402
+
 
 def detect_interfaces() -> list[tuple[str, str]]:
     """Return (ip, iface) pairs for active adapters, best candidates first."""
@@ -124,11 +127,15 @@ def write_configs(
     knocker_ip: str,
     server_video_port: int,
     knocker_control_port: int,
+    video_stem: str | None = None,
 ) -> dict:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     server_cfg = build_server_yaml(server_ip, server_video_port, knocker_ip)
     knocker_cfg = build_knocker_yaml(server_ip, server_video_port, knocker_ip, knocker_control_port)
+    if video_stem:
+        server_cfg["video"] = video_block_for_stem(video_stem)
+        knocker_cfg["video"] = video_block_for_stem(video_stem)
 
     server_path = OUT_DIR / "server.yaml"
     knocker_path = OUT_DIR / "knocker.yaml"
@@ -146,6 +153,8 @@ def write_configs(
         "knocker_config": str(knocker_path.relative_to(ROOT)),
         "server_iface": server_cfg["server"]["iface"],
         "totp_secret": DEFAULT_TOTP,
+        "video_stem": video_stem,
+        "knock_mode": "same-host" if server_ip == knocker_ip else "cross-host",
         "commands": {
             "prepare_video": "python scripts/generate_sample_video.py && python scripts/encrypt_video.py",
             "server": f"python scripts/run_lab_server.py --config {server_path.relative_to(ROOT)}",
@@ -182,6 +191,10 @@ def main() -> None:
         default=8766,
         help="Local control port on knocker (different from server video port)",
     )
+    parser.add_argument(
+        "--video-stem",
+        help="Artifact stem after encrypt_video (e.g. my_movie for artifacts/my_movie.enc)",
+    )
     args = parser.parse_args()
 
     if args.auto:
@@ -210,6 +223,7 @@ def main() -> None:
         knocker_ip=knocker_ip,
         server_video_port=args.server_video_port,
         knocker_control_port=args.knocker_control_port,
+        video_stem=args.video_stem,
     )
 
     print()
@@ -221,8 +235,16 @@ def main() -> None:
     print(f"  Server IP          : {info['server_ip']}  (video HTTP port {info['server_video_port']})")
     print(f"  Knocker IP         : {info['knocker_ip']}  (control port {info['knocker_control_port']})")
     print(f"  Server interface   : {info['server_iface']}")
+    print(f"  Knock mode         : {info['knock_mode']}")
+    if info.get("video_stem"):
+        print(f"  Video stem         : {info['video_stem']}")
     print()
-    print("Next: python scripts/generate_sample_video.py && python scripts/encrypt_video.py")
+    print("IPs in YAML:")
+    print(f"  server.yaml  → server.ip={server_ip}  client.ip={knocker_ip}  (client.ip = knocker machine)")
+    print(f"  knocker.yaml → server.ip={server_ip}  client.ip={knocker_ip}")
+    print_test_matrix()
+    print("Video: python scripts/encrypt_video.py <any_video_file>")
+    print("       python scripts/sync_lab_video.py --stem <stem>")
 
 
 if __name__ == "__main__":

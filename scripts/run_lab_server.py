@@ -22,6 +22,23 @@ from pathlib import Path
 from rich.console import Console
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from lab_config_common import (  # noqa: E402
+    cross_host_display,
+    display_knock_label,
+    knock_mode_label,
+    lab_banner_lines,
+    load_display_overlay,
+    overlay_banner_lines,
+    peer_generated_config,
+    print_display_ips,
+    show_layout_banner,
+    terminal_peer_ip,
+    terminal_server_ip,
+    totp_tag,
+    validate_generated_pair,
+)
+
 console = Console()
 
 SESSION_GAP = 2.0
@@ -103,6 +120,13 @@ def open_video_artifact(cfg) -> VideoArtifact:
 class LabHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = False
 
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, BrokenPipeError, ConnectionResetError)):
+            console.print(f"[dim]HTTP client {client_address[0]} disconnected early[/dim]")
+            return
+        super().handle_error(request, client_address)
+
 
 def ensure_port_available(port: int) -> None:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -142,13 +166,22 @@ def verify_http_health(port: int) -> None:
         sys.exit(1)
 
 
-def make_handler(registry: AuthRegistry, video: VideoArtifact, keyfrag_path: Path):
+def make_handler(
+    registry: AuthRegistry,
+    video: VideoArtifact,
+    keyfrag_path: Path,
+    *,
+    log_client_ip=None,
+):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
-            console.print(f"[dim]HTTP {self.address_string()} {fmt % args}[/dim]")
+            addr = self.client_address[0]
+            shown = log_client_ip(addr) if log_client_ip else addr
+            console.print(f"[dim]HTTP {shown} {fmt % args}[/dim]")
 
         def do_GET(self) -> None:
             client_ip = self.client_address[0]
+            shown_ip = log_client_ip(client_ip) if log_client_ip else client_ip
             if self.path in ("/", "/health"):
                 body = json.dumps({
                     "status": "ok",
@@ -179,7 +212,7 @@ def make_handler(registry: AuthRegistry, video: VideoArtifact, keyfrag_path: Pat
                 if not registry.is_authorized(client_ip):
                     self.send_response(403)
                     self.end_headers()
-                    console.print(f"[yellow]Denied key fragment to unauthorized {client_ip}[/yellow]")
+                    console.print(f"[yellow]Denied key fragment to unauthorized {shown_ip}[/yellow]")
                     return
                 if not keyfrag_path.is_file():
                     self.send_response(404)
@@ -192,7 +225,7 @@ def make_handler(registry: AuthRegistry, video: VideoArtifact, keyfrag_path: Pat
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-                console.print(f"[green]Key fragment delivered via HTTP to {client_ip}[/green]")
+                console.print(f"[green]Key fragment delivered via HTTP to {shown_ip}[/green]")
                 return
 
             if self.path == "/video/stream":
@@ -208,7 +241,7 @@ def make_handler(registry: AuthRegistry, video: VideoArtifact, keyfrag_path: Pat
                 video.stream_to(self.wfile)
                 authorized = registry.is_authorized(client_ip)
                 console.print(
-                    f"[green]Encrypted video sent to {client_ip} ({video.size} bytes)"
+                    f"[green]Encrypted video sent to {shown_ip} ({video.size} bytes)"
                     f"{'  [authorized — key fragment already sent via ICMP]' if authorized else '  [NOT authorized — no key fragment]'}[/green]"
                 )
                 return
@@ -219,7 +252,9 @@ def make_handler(registry: AuthRegistry, video: VideoArtifact, keyfrag_path: Pat
     return Handler
 
 
-def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) -> None:
+def run_sniffer(
+    cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str, config_path: Path
+) -> None:
     from nps_lab_el.models.auth import AuthorizationState, CaptureEvent
     from nps_lab_el.platform.capture import CaptureBackend, SimulationCapture
     from nps_lab_el.platform.permissions import require_privileges
@@ -238,11 +273,36 @@ def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) 
     else:
         same_host = cfg.server.ip == cfg.client.ip
         sniff_iface = cfg.server.iface
+        overlay = load_display_overlay()
         if same_host:
             sniff_iface = r"\Device\NPF_Loopback" if sys.platform == "win32" else "lo"
-            console.print(
-                f"[cyan]Same-host lab: sniffing on {sniff_iface}, knock via 127.0.0.1[/cyan]"
-            )
+            if cross_host_display(overlay):
+                si = str(overlay["server_ip"])
+                kc = str(overlay["knocker_client_ip"])
+                console.print(
+                    f"[cyan]Cross-host display (one PC): client {kc} → server {si}[/cyan]"
+                )
+                console.print(
+                    f"[dim]  Sniffer on {sniff_iface}; generated YAML same-host for loopback knock.[/dim]"
+                )
+            else:
+                knock_via = terminal_peer_ip(
+                    "127.0.0.1",
+                    role="server",
+                    overlay=overlay,
+                    cfg_server_ip=cfg.server.ip,
+                    cfg_client_ip=cfg.client.ip,
+                )
+                console.print(
+                    f"[cyan]Same-host lab: sniffing on {sniff_iface}, knock via {knock_via}[/cyan]"
+                )
+                console.print(
+                    "[dim]  Keep generated knocker.yaml client.ip equal to server.ip on one PC.[/dim]"
+                )
+        elif overlay and cross_host_display(overlay):
+            si = str(overlay["server_ip"])
+            kc = str(overlay["knocker_client_ip"])
+            console.print(f"[cyan]Cross-host lab: client {kc} → server {si}[/cyan]")
         capture = CaptureBackend(
             iface=sniff_iface,
             server_ip=cfg.server.ip,
@@ -252,24 +312,56 @@ def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) 
     def process(src_ip: str, events: list[CaptureEvent]) -> None:
         try:
             session = engine.process_events(events)
-            if session.state == AuthorizationState.DENIED and same_host:
+            if session.state == AuthorizationState.DENIED:
                 for relaxed_tau in (25, 50):
                     retry = engine.process_events(events, jitter_tau_ms=relaxed_tau)
                     if retry.state == AuthorizationState.AUTHORIZED:
-                        console.print(f"[dim]  loopback decode ok with tau_ms={relaxed_tau}[/dim]")
+                        console.print(f"[dim]  jitter decode ok with tau_ms={relaxed_tau}[/dim]")
                         session = retry
                         break
         except Exception as exc:
             console.print(f"[red]Knock processing error from {src_ip}: {exc}[/red]")
             return
-        console.print(f"[bold]Knock from {src_ip}: {session.state}[/bold]  ({len(events)} packets)")
-        if session.state == AuthorizationState.DENIED:
+        overlay = load_display_overlay()
+        shown_src = terminal_peer_ip(
+            src_ip,
+            role="server",
+            overlay=overlay,
+            cfg_server_ip=cfg.server.ip,
+            cfg_client_ip=cfg.client.ip,
+        )
+        if overlay is not None:
+            si = overlay["server_ip"]
+            kc = overlay["knocker_client_ip"]
+            mode, _ = display_knock_label(overlay)
             console.print(
-                "[dim]  DENIED = bad timing decode, wrong totp_secret, or MAC mismatch "
-                "(knocker.yaml and server.yaml must match)[/dim]"
+                f"[bold]Knock from {shown_src}: {session.state}[/bold]  ({len(events)} packets)  "
+                f"[dim]server.ip={si} client.ip={kc} mode={mode}[/dim]"
             )
+        else:
+            peer_cfg, _ = peer_generated_config("server", config_path)
+            kc = peer_cfg.client.ip if peer_cfg is not None else cfg.client.ip
+            mode, _ = knock_mode_label(cfg.server.ip, kc)
+            console.print(
+                f"[bold]Knock from {shown_src}: {session.state}[/bold]  ({len(events)} packets)  "
+                f"[dim]server.ip={cfg.server.ip} client.ip={kc} mode={mode}[/dim]"
+            )
+        if session.state == AuthorizationState.DENIED:
+            peer_cfg, _ = peer_generated_config("server", config_path)
+            if peer_cfg is not None and cfg.auth.totp_secret != peer_cfg.auth.totp_secret:
+                console.print(
+                    f"[yellow]  DENIED: TOTP mismatch — server …{totp_tag(cfg.auth.totp_secret)} "
+                    f"vs knocker …{totp_tag(peer_cfg.auth.totp_secret)}[/yellow]"
+                )
+            else:
+                console.print(
+                    "[dim]  DENIED: bad timing decode or MAC mismatch "
+                    "(cross-host: use jitter; same-host: check header/TOTP match)[/dim]"
+                )
         if session.state == AuthorizationState.AUTHORIZED:
             registry.authorize(src_ip)
+            # Client often talks HTTP via 127.0.0.1 while knock src is LAN/loopback.
+            registry.authorize("127.0.0.1")
             if cfg.server.ip == cfg.client.ip and src_ip == "127.0.0.1":
                 registry.authorize(cfg.server.ip)
             if drm is not None and not capture.simulation:
@@ -293,7 +385,7 @@ def run_sniffer(cfg, registry: AuthRegistry, simulation: bool, knocker_ip: str) 
                     session_nonce=session_nonce,
                 )
                 scapy_send(reply, verbose=False)
-                console.print(f"[green]DRM ICMP reply sent to {src_ip}[/green]")
+                console.print(f"[green]DRM ICMP reply sent to {shown_src}[/green]")
 
     def callback(packet) -> None:
         event = capture.parse_packet(packet)
@@ -342,7 +434,20 @@ def main() -> None:
     sys.path.insert(0, str(ROOT / "src"))
     from nps_lab_el.models.config import load_config
 
-    cfg = load_config(args.config)
+    cfg_path = ROOT / args.config if not Path(args.config).is_absolute() else Path(args.config)
+    validate_generated_pair(cfg_path, "server", console=console)
+    cfg = load_config(str(cfg_path))
+    peer_cfg, _ = peer_generated_config("server", cfg_path)
+    if show_layout_banner():
+        display_overlay = load_display_overlay()
+        if display_overlay:
+            lines = overlay_banner_lines("server", display_overlay, cfg, cfg_path, peer_cfg=peer_cfg)
+        else:
+            lines = lab_banner_lines("server", cfg, cfg_path, peer_cfg=peer_cfg)
+        for line in lines:
+            style = "yellow" if line.startswith("  WARNING") or "MISMATCH" in line else "cyan"
+            console.print(f"[{style}]{line}[/{style}]")
+    print_display_ips(console)
 
     registry = AuthRegistry(ttl_seconds=cfg.auth.ttl_auth_seconds)
     video = open_video_artifact(cfg)
@@ -350,21 +455,36 @@ def main() -> None:
     port = cfg.server.video_port
     ensure_port_available(port)
     bind_ip = "0.0.0.0"
-    handler = make_handler(registry, video, ROOT / cfg.video.keyfrag)
+    display_overlay = load_display_overlay()
+    log_client_ip = lambda ip: terminal_peer_ip(
+        ip,
+        role="server",
+        overlay=display_overlay,
+        cfg_server_ip=cfg.server.ip,
+        cfg_client_ip=cfg.client.ip,
+    )
+    handler = make_handler(
+        registry, video, ROOT / cfg.video.keyfrag, log_client_ip=log_client_ip
+    )
     httpd = LabHTTPServer((bind_ip, port), handler)
     httpd_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     httpd_thread.start()
     verify_http_health(port)
 
+    health_host = terminal_server_ip(
+        "127.0.0.1",
+        overlay=display_overlay,
+        cfg_server_ip=cfg.server.ip,
+    )
     console.print(f"[bold green]Video server ready on port {port}[/bold green]")
-    console.print(f"[bold green]  http://127.0.0.1:{port}/health[/bold green]")
+    console.print(f"[bold green]  http://{health_host}:{port}/health[/bold green]")
     console.print(f"[bold green]  http://{cfg.server.ip}:{port}/video/stream[/bold green]")
     console.print(f"[dim]Encrypted artifact: {video.filename} ({video.size} bytes)[/dim]")
 
     if not args.http_only:
         sniffer_thread = threading.Thread(
             target=run_sniffer,
-            args=(cfg, registry, args.simulation, cfg.client.ip),
+            args=(cfg, registry, args.simulation, cfg.client.ip, cfg_path),
             daemon=True,
         )
         sniffer_thread.start()

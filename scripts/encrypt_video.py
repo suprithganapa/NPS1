@@ -65,6 +65,9 @@ def encrypt_video(video_path: Path) -> None:
     secret_path = secrets_dir / f"{stem}.keyfrag"
     secret_path.write_bytes(key_fragment)
     print(f"Server key fragment saved to: {secret_path}  (DO NOT share)")
+    print()
+    print("Point lab configs at this video (any format — mp4, avi, mkv, …):")
+    print(f"  python scripts/sync_lab_video.py --stem {stem}")
 
 
 if __name__ == "__main__":

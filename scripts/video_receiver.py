@@ -25,6 +25,26 @@ from pathlib import Path
 from rich.console import Console
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from lab_config_common import (  # noqa: E402
+    cross_host_display,
+    display_ips_differ,
+    display_knocker_ip,
+    display_knock_label,
+    display_server_ip,
+    http_hosts_for,
+    lab_banner_lines,
+    load_display_overlay,
+    overlay_banner_lines,
+    peer_generated_config,
+    print_display_ips,
+    show_layout_banner,
+    terminal_http_host,
+    terminal_peer_ip,
+    totp_tag,
+    validate_generated_pair,
+)
+
 console = Console()
 
 
@@ -123,6 +143,16 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
 
     require_privileges(simulation=simulation)
 
+    overlay = load_display_overlay()
+    show_cross = overlay is not None and display_ips_differ(overlay)
+    show_ip = lambda ip: terminal_peer_ip(
+        ip,
+        role="knocker",
+        overlay=overlay,
+        cfg_server_ip=server_ip,
+        cfg_client_ip=cfg.client.ip,
+    )
+
     knock_target = resolve_knock_target(server_ip, cfg.client.ip)
     use_header = knock_target == "127.0.0.1" and cfg.channels.header.enabled
 
@@ -138,10 +168,19 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
             console.print(f"[cyan]Simulation header knock[/cyan] ({len(header_pairs)} packets)")
             return None
         est_sec = len(header_pairs) * 0.01
-        console.print(
-            f"[green]Sending header knock to {knock_target}[/green] "
-            f"({len(header_pairs)} packets, ~{est_sec:.1f}s, loopback-safe)..."
-        )
+        if show_cross:
+            mode, _ = display_knock_label(overlay)
+            kc = overlay["knocker_client_ip"]
+            si = overlay["server_ip"]
+            console.print(
+                f"[green]Sending knock from {kc} to {si}[/green] "
+                f"({mode}, {len(header_pairs)} packets, ~{est_sec:.1f}s)..."
+            )
+        else:
+            console.print(
+                f"[green]Sending header knock to {show_ip(knock_target)}[/green] "
+                f"({len(header_pairs)} packets, ~{est_sec:.1f}s)..."
+            )
     else:
         channel_mask = 0x01
         token = _build_auth_token(cfg, channel_mask)
@@ -157,13 +196,19 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
             return None
         est_sec = _estimate_knock_seconds(jitter_sequence)
         packet_count = len(jitter_sequence) + 1
-        console.print(
-            f"[green]Sending jitter knock to {knock_target}[/green] "
-            f"({packet_count} packets, ~{est_sec:.0f}s)..."
-        )
+        if show_cross:
+            kc = overlay["knocker_client_ip"]
+            si = overlay["server_ip"]
+            console.print(
+                f"[green]Sending jitter knock from {kc} to {si}[/green] "
+                f"({packet_count} packets, ~{est_sec:.0f}s)..."
+            )
+        else:
+            console.print(
+                f"[green]Sending jitter knock to {show_ip(knock_target)}[/green] "
+                f"({packet_count} packets, ~{est_sec:.0f}s)..."
+            )
 
-    if knock_target != server_ip:
-        console.print(f"[dim]  (same PC — using loopback; server IP in config is {server_ip})[/dim]")
     console.print("[dim]Server must be running (Admin) with ICMP sniffer — not --http-only[/dim]")
 
     from scapy.all import ICMP, IP, send
@@ -213,15 +258,6 @@ def send_knock(cfg, server_ip: str, simulation: bool) -> bytes | None:
     return None
 
 
-def http_hosts_for(server_ip: str) -> list[str]:
-    """On the same PC, 127.0.0.1 is more reliable than the hotspot/LAN IP for HTTP."""
-    hosts: list[str] = []
-    for host in ("127.0.0.1", server_ip):
-        if host not in hosts:
-            hosts.append(host)
-    return hosts
-
-
 def fetch_key_fragment_http(http_host: str, video_port: int) -> bytes | None:
     """After a successful knock, server may expose the fragment to authorized clients."""
     url = f"http://{http_host}:{video_port}/drm/key-fragment"
@@ -238,10 +274,13 @@ def fetch_key_fragment_http(http_host: str, video_port: int) -> bytes | None:
     return None
 
 
-def fetch_encrypted_video(http_host: str, video_port: int, enc_path: Path) -> None:
+def fetch_encrypted_video(
+    http_host: str, video_port: int, enc_path: Path, *, display_host: str | None = None
+) -> None:
     """Download the encrypted .enc file — no auth required, it's just ciphertext."""
     url = f"http://{http_host}:{video_port}/video/stream"
-    console.print(f"[bold]Downloading encrypted video from {url}[/bold]")
+    shown = display_host or http_host
+    console.print(f"[bold]Downloading encrypted video from http://{shown}:{video_port}/video/stream[/bold]")
     try:
         with urllib.request.urlopen(url, timeout=600) as resp:
             data = resp.read()
@@ -282,28 +321,110 @@ def decrypt_video(enc_path: Path, manifest_path: Path, key_fragment: bytes, out_
     return True
 
 
-def check_health(server_ip: str, video_port: int) -> str:
-    """Return the HTTP host that responded (127.0.0.1 or server_ip)."""
+def _reject_cross_host_on_server_pc(
+    server_ip: str, configured_client_ip: str, health_client_ip: str
+) -> None:
+    """Cross-host YAML on the server machine breaks jitter knock + Wi-Fi sniffer."""
+    console.print("[red]This PC is the server, not the knocker.[/red]")
+    console.print(
+        f"  Health shows your HTTP client as [bold]{health_client_ip}[/bold] "
+        f"(server), but knocker.yaml says client.ip=[bold]{configured_client_ip}[/bold]."
+    )
+    console.print(
+        f"  Jitter knocks to {server_ip} from this machine are not decoded on the Wi-Fi sniffer."
+    )
+    console.print()
+    console.print("[yellow]Pick one:[/yellow]")
+    console.print(
+        f"  [bold]Same PC test:[/bold] set client.ip = {server_ip} in [bold]both[/bold] "
+        "server.yaml and knocker.yaml, restart server (loopback sniffer)."
+    )
+    console.print(
+        f"  [bold]Two PC test:[/bold] run this script on the machine that has IP {configured_client_ip}."
+    )
+    console.print()
+    console.print(
+        f"  Regenerate same-PC: python scripts/generate_lab_configs.py "
+        f"--server-ip {server_ip} --knocker-ip {server_ip} --server-video-port 8780"
+    )
+    sys.exit(1)
+
+
+def check_health(
+    server_ip: str,
+    video_port: int,
+    client_ip: str,
+    *,
+    overlay: dict | None = None,
+    cfg_client_ip: str | None = None,
+) -> tuple[str, str]:
+    """Return (http_host, client_ip seen by server /health)."""
+    cross_host_cfg = client_ip != server_ip
+    show_si = display_server_ip(overlay, server_ip)
+    show_kc = display_knocker_ip(overlay, client_ip)
     errors: list[str] = []
-    for host in http_hosts_for(server_ip):
+    for host in http_hosts_for(server_ip, client_ip):
         url = f"http://{host}:{video_port}/health"
         try:
-            with urllib.request.urlopen(url, timeout=15) as resp:
+            with urllib.request.urlopen(url, timeout=30) as resp:
                 info = json.loads(resp.read())
-            console.print(f"[dim]Server health ({host}): {info}[/dim]")
-            return host
+            shown_host = terminal_http_host(
+                host,
+                role="knocker",
+                overlay=overlay,
+                cfg_server_ip=server_ip,
+                cfg_client_ip=cfg_client_ip or client_ip,
+            )
+            shown_info = dict(info)
+            if "client_ip" in shown_info:
+                shown_info["client_ip"] = terminal_peer_ip(
+                    str(shown_info["client_ip"]),
+                    role="knocker",
+                    overlay=overlay,
+                    cfg_server_ip=server_ip,
+                    cfg_client_ip=cfg_client_ip or client_ip,
+                )
+            console.print(f"[dim]Server health ({shown_host}): {shown_info}[/dim]")
+            seen = str(info.get("client_ip", ""))
+            if (
+                cross_host_cfg
+                and seen == server_ip
+                and not cross_host_display(overlay)
+            ):
+                _reject_cross_host_on_server_pc(server_ip, client_ip, seen)
+            return host, seen
         except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
             errors.append(f"{url} -> {exc}")
 
     console.print("[red]Server not reachable.[/red]")
     for line in errors:
         console.print(f"[red]  {line}[/red]")
-    console.print("[yellow]Fix:[/yellow]")
-    console.print("  1. Administrator PowerShell: netstat -ano | findstr :8765")
-    console.print("  2. taskkill /F /PID <pid>   (stop ALL old servers)")
-    console.print("  3. Start ONE server (no --simulation):")
-    console.print("     python scripts/run_lab_server.py --config config/generated/server.yaml")
-    console.print("  4. Test: Invoke-RestMethod http://127.0.0.1:8765/health")
+    if cross_host_cfg or cross_host_display(overlay):
+        console.print("[yellow]Cross-host checklist:[/yellow]")
+        console.print(
+            f"  1. Server must run on [bold]{show_si}[/bold] (Admin): "
+            "python scripts/run_lab_server.py --config config/generated/server.yaml"
+        )
+        console.print(
+            f"  2. Run this client on [bold]{show_kc}[/bold] "
+            "(one-PC demo: keep generated YAML client.ip == server.ip)"
+        )
+        console.print(f"  3. On knocker PC: Test-NetConnection {show_si} -Port {video_port}")
+        console.print(
+            f"  4. On server PC: allow inbound TCP {video_port} "
+            "(Windows Firewall → Python → Private networks)"
+        )
+        console.print(f"  5. Browser on knocker: http://{show_si}:{video_port}/health")
+        if cross_host_display(overlay) and not cross_host_cfg:
+            console.print(
+                f"  One-PC display: config_ip.yaml shows {show_kc} → {show_si}; "
+                "generated YAML stays same-host for knock."
+            )
+    else:
+        console.print("[yellow]Same-host fix:[/yellow]")
+        console.print(f"  netstat -ano | findstr :{video_port}")
+        console.print("  taskkill /F /PID <pid>  then start ONE server (Admin)")
+        console.print(f"  Invoke-RestMethod http://{show_si}:{video_port}/health")
     sys.exit(1)
 
 
@@ -325,6 +446,7 @@ def main() -> None:
 
     cfg_path = ROOT / args.config if not Path(args.config).is_absolute() else Path(args.config)
     cfg = load_config(str(cfg_path))
+    validate_generated_pair(cfg_path, "knocker", console=console)
 
     server_ip = cfg.server.ip
     video_port = cfg.server.video_port
@@ -332,11 +454,34 @@ def main() -> None:
     enc_path = out_path.with_suffix(".enc")
     manifest_path = ROOT / cfg.video.artifact_manifest
 
-    console.print(f"[bold]Knocker IP[/bold]  : {cfg.client.ip}  (control port {cfg.client.control_port})")
-    console.print(f"[bold]Server IP[/bold]   : {server_ip}  (video port {video_port})")
-    console.print()
+    peer_cfg, _ = peer_generated_config("knocker", cfg_path)
+    if show_layout_banner():
+        display_overlay = load_display_overlay()
+        if display_overlay:
+            lines = overlay_banner_lines("knocker", display_overlay, cfg, cfg_path, peer_cfg=peer_cfg)
+        else:
+            lines = lab_banner_lines("knocker", cfg, cfg_path, peer_cfg=peer_cfg)
+        for line in lines:
+            style = "yellow" if "MISMATCH" in line or line.startswith("  WARNING") else "bold cyan"
+            console.print(f"[{style}]{line}[/{style}]")
+        console.print()
+    print_display_ips(console)
 
-    http_host = check_health(server_ip, video_port)
+    display_overlay = load_display_overlay()
+    http_host, _health_client_ip = check_health(
+        server_ip,
+        video_port,
+        cfg.client.ip,
+        overlay=display_overlay,
+        cfg_client_ip=cfg.client.ip,
+    )
+    http_display = terminal_http_host(
+        http_host,
+        role="knocker",
+        overlay=display_overlay,
+        cfg_server_ip=server_ip,
+        cfg_client_ip=cfg.client.ip,
+    )
 
     key_fragment: bytes | None = None
 
@@ -353,11 +498,17 @@ def main() -> None:
             time.sleep(4)
             key_fragment = fetch_key_fragment_http(http_host, video_port)
             if key_fragment is None:
-                console.print("[red]Knock did not authorize client (check server: AUTHORIZED?).[/red]")
+                if peer_cfg is not None and cfg.auth.totp_secret != peer_cfg.auth.totp_secret:
+                    console.print(
+                        f"[red]Knock denied — TOTP mismatch (knocker …{totp_tag(cfg.auth.totp_secret)} "
+                        f"vs server …{totp_tag(peer_cfg.auth.totp_secret)})[/red]"
+                    )
+                else:
+                    console.print("[red]Knock did not authorize (check server log: AUTHORIZED vs DENIED).[/red]")
                 sys.exit(1)
 
     # Download the encrypted blob (open to anyone — useless without the key fragment)
-    fetch_encrypted_video(http_host, video_port, enc_path)
+    fetch_encrypted_video(http_host, video_port, enc_path, display_host=http_display)
 
     if key_fragment is None:
         console.print("[yellow]Simulation mode: no key fragment — skipping decryption.[/yellow]")
