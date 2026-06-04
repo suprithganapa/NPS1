@@ -103,20 +103,15 @@ def _sniff_for_full_key(
     sniff_kwargs: dict = {
         "filter": "icmp",
         "prn": _on_reply,
-        "store": 1,
+        "store": 0,  # don't accumulate all packets in RAM
         "stop_filter": lambda _: bool(result),
         "timeout": 45,
-        "count": FULL_KEY_REPLY_PACKETS * 2,  # collect up to 2× in case of duplicates
+        # No count limit — OS auto-replies to the knock fill a small count
+        # before the server's 8 DRM reply packets arrive.
     }
     if iface:
         sniff_kwargs["iface"] = iface
     sniff(**sniff_kwargs)
-    # Final attempt to assemble from whatever arrived
-    if not result and collected:
-        from nps_lab_el.services.drm_responder import DrmResponder
-        key = DrmResponder.extract_full_key_from_replies(collected, session_nonce)
-        if key is not None:
-            result.append(key)
 
 
 def _build_auth_token(cfg, channel_mask: int) -> "AuthToken":
@@ -309,6 +304,25 @@ def fetch_key_fragment_http(http_host: str, video_port: int) -> bytes | None:
             return fragment
     except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
         console.print(f"[yellow]HTTP key fragment not available: {exc}[/yellow]")
+    return None
+
+
+def fetch_session_token(http_host: str, video_port: int) -> str | None:
+    """Retrieve the session token for this client IP from the server after a successful knock."""
+    url = f"http://{http_host}:{video_port}/session/token"
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = json.loads(resp.read())
+            token = data.get("token", "")
+            if token:
+                console.print(f"[green]Session token retrieved ({token[:8]}…)[/green]")
+                return token
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            pass
+        if attempt < 3:
+            time.sleep(1)
+    console.print("[yellow]Could not retrieve session token from server[/yellow]")
     return None
 
 
@@ -564,11 +578,22 @@ def main() -> None:
         aad = _b64.b64decode(_manifest_data["aad_b64"])
         seg_count = _manifest_data["segment_count"]
         sniff_iface = r"\Device\NPF_Loopback" if sys.platform == "win32" and server_ip == cfg.client.ip else None
-        session_nonce = int.from_bytes(os.urandom(2), "big") if not args.simulation else 0
+
+        # Fetch session token via HTTP (server issues it after the ICMP knock authorizes the IP)
+        current_token = ""
+        if not args.simulation:
+            time.sleep(1)  # give the server a moment to commit the session
+            fetched = fetch_session_token(http_host, video_port)
+            if fetched is None:
+                console.print("[red]No session token — ICMP knock may not have been received by server[/red]")
+                sys.exit(1)
+            current_token = fetched
+
+        # Server derives nonce for subsequent key packets from the first 2 bytes of the token
+        subsequent_nonce = (int(current_token[:4], 16) & 0xFFFF) if current_token else 0
 
         plaintext_parts: list[bytes] = []
         current_key = seg0_key
-        current_token = session_token
 
         for seg_idx in range(seg_count):
             seg_meta = _manifest_data["segments"][seg_idx]
@@ -578,7 +603,7 @@ def main() -> None:
             # For segments beyond 0, wait for next key via ICMP (server sends it alongside previous segment)
             if seg_idx > 0 and not args.simulation:
                 console.print(f"[dim]Waiting for key for segment {seg_idx} via ICMP…[/dim]")
-                current_key = _sniff_for_segment_key(server_ip, session_nonce, iface=sniff_iface)
+                current_key = _sniff_for_segment_key(server_ip, subsequent_nonce, iface=sniff_iface)
                 if current_key is None:
                     console.print(f"[red]No key received for segment {seg_idx} — aborting[/red]")
                     sys.exit(1)

@@ -166,6 +166,13 @@ class SegmentSessionRegistry:
                 return None
             return entry
 
+    def get_token_for_ip(self, ip: str) -> str | None:
+        with self._lock:
+            token = self._ip_to_token.get(ip)
+            if token and token in self._sessions and self._sessions[token].is_valid():
+                return token
+            return None
+
     def revoke_ip(self, ip: str) -> None:
         with self._lock:
             token = self._ip_to_token.get(ip)
@@ -298,6 +305,21 @@ def make_handler(
                 self.end_headers()
                 self.wfile.write(body)
                 console.print(f"[green]Key fragment delivered via HTTP to {shown_ip}[/green]")
+                return
+
+            if self.path == "/session/token":
+                if seg_registry is None:
+                    self._json(404, {"error": "segment DRM not active"})
+                    return
+                # Try both the real client IP and loopback alias (same-host case)
+                token = seg_registry.get_token_for_ip(client_ip)
+                if token is None:
+                    token = seg_registry.get_token_for_ip("127.0.0.1")
+                if token is None:
+                    self._json(403, {"error": "no active session for this IP — complete ICMP knock first"})
+                    return
+                self._json(200, {"token": token})
+                console.print(f"[green]Session token issued to {shown_ip}[/green]")
                 return
 
             if self.path == "/video/stream":
