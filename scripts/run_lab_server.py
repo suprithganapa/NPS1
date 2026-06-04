@@ -87,20 +87,23 @@ class VideoArtifact:
     """Lazy video access — avoids loading 100MB+ into RAM before HTTP is ready."""
 
     def __init__(self, enc_path: Path, manifest_path: Path) -> None:
-        if not manifest_path.is_file() or not enc_path.is_file():
+        if not manifest_path.is_file():
             raise FileNotFoundError(
-                f"Missing artifacts: {enc_path} or {manifest_path}. "
+                f"Missing manifest: {manifest_path}. "
                 "Run: python scripts/encrypt_video.py <video>"
             )
-        self.enc_path = enc_path
         self.manifest = json.loads(manifest_path.read_text())
         self.filename = self.manifest.get("source_filename", "video.enc")
+        # .enc may not exist in segment DRM mode (segments are served individually)
+        self.enc_path = enc_path if enc_path.is_file() else None
 
     @property
     def size(self) -> int:
-        return self.enc_path.stat().st_size
+        return self.enc_path.stat().st_size if self.enc_path else 0
 
     def stream_to(self, wfile, chunk_size: int = 1024 * 1024) -> None:
+        if self.enc_path is None:
+            return
         with self.enc_path.open("rb") as fh:
             while True:
                 chunk = fh.read(chunk_size)
@@ -116,6 +119,7 @@ def open_video_artifact(cfg) -> VideoArtifact:
         return VideoArtifact(enc_path, manifest_path)
     except FileNotFoundError as exc:
         console.print(f"[red]{exc}[/red]")
+        console.print("[yellow]Run: python scripts/sync_lab_video.py --stem <stem>[/yellow]")
         sys.exit(1)
 
 
