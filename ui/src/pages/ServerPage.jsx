@@ -1,38 +1,94 @@
 import { useState, useRef, useEffect } from 'react'
 
+const c = {
+  bg: '#0B0909', surface: '#0F0D0D', inset: '#080606',
+  border: '#2E4540', divider: 'rgba(46,69,64,0.45)',
+  teal: '#408175', tealText: '#79ADA2', lav: '#B5B9F0',
+  text: '#E7E4E0', dim: '#8E938F', faint: '#5C605D',
+}
+const serif = "'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif"
+const mono  = "ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace"
+const sans  = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+
+const Ico = {
+  upload: p => (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <path d="M12 15V4" /><path d="M8 8l4-4 4 4" />
+      <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+    </svg>
+  ),
+  lock: p => (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <rect x="4" y="10.5" width="16" height="9.5" rx="1.5" /><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5" />
+    </svg>
+  ),
+  play: p => (
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" {...p}><path d="M7 4.5v15l13-7.5z" /></svg>
+  ),
+  stop: p => (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" {...p}><rect x="5" y="5" width="14" height="14" rx="1.5" /></svg>
+  ),
+  check: p => (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M5 12.5l4.5 4.5L19 6.5" /></svg>
+  ),
+}
+
 const s = {
-  page: { minHeight: '100vh', background: 'linear-gradient(135deg,#0d1117 0%,#161b22 100%)',
-    display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '48px 24px' },
-  card: { background: '#161b22', border: '1px solid #30363d', borderRadius: '12px',
-    padding: '28px 32px', width: '100%', maxWidth: '580px', marginBottom: '16px' },
-  title: { fontSize: '20px', fontWeight: 700, color: '#58a6ff', marginBottom: '6px',
-    display: 'flex', alignItems: 'center', gap: '10px' },
-  sub: { fontSize: '12px', color: '#8b949e', marginBottom: '22px' },
-  fileArea: { border: '2px dashed #30363d', borderRadius: '8px', padding: '26px',
-    textAlign: 'center', cursor: 'pointer', transition: 'border-color .15s', marginBottom: '12px' },
-  fileAreaHov: { borderColor: '#58a6ff' },
-  fileText: { color: '#8b949e', fontSize: '13px' },
-  fileName: { color: '#e6edf3', fontSize: '13px', fontWeight: 600, marginTop: '6px' },
-  btn: { width: '100%', padding: '10px', borderRadius: '7px', border: 'none',
-    fontSize: '13px', fontWeight: 600, marginBottom: '10px', cursor: 'pointer' },
-  green: { background: '#238636', color: '#fff' },
-  blue:  { background: '#1f6feb', color: '#fff' },
-  red:   { background: '#b91c1c', color: '#fff' },
-  off:   { opacity: .38, cursor: 'not-allowed' },
-  divider: { height: '1px', background: '#21262d', margin: '16px 0' },
-  stepRow: { display: 'flex', alignItems: 'center', gap: '9px', marginBottom: '13px' },
+  page: { minHeight: '100vh', background: c.bg, color: c.text, fontFamily: sans,
+    display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '64px 24px' },
+  card: { background: c.surface, border: `1px solid ${c.border}`, borderRadius: '6px',
+    padding: '34px 36px', width: '100%', maxWidth: '600px' },
+
+  eyebrow: { fontFamily: mono, fontSize: '11px', letterSpacing: '0.2em', textTransform: 'uppercase',
+    color: c.teal, marginBottom: '13px' },
+  title: { fontFamily: serif, fontSize: '25px', fontWeight: 600, color: c.text,
+    letterSpacing: '-0.01em', margin: 0 },
+  sub: { fontSize: '13px', color: c.dim, marginTop: '9px', lineHeight: 1.55 },
+  rule: { height: '1px', background: c.divider, margin: '26px 0' },
+
+  stepRow: { display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' },
   stepNum: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    width: '21px', height: '21px', borderRadius: '50%', background: '#58a6ff22',
-    color: '#58a6ff', fontSize: '11px', fontWeight: 700, flexShrink: 0 },
-  stepLabel: { fontSize: '13px', fontWeight: 600, color: '#e6edf3' },
-  stepDone: { fontSize: '11px', fontWeight: 600, color: '#3fb950' },
-  badge: { display: 'inline-flex', alignItems: 'center', gap: '5px',
-    padding: '3px 9px', borderRadius: '20px', fontSize: '11px', fontWeight: 600 },
-  dot: { width: '7px', height: '7px', borderRadius: '50%' },
-  logBox: { background: '#010409', border: '1px solid #21262d', borderRadius: '6px',
-    padding: '10px 12px', fontSize: '11px', color: '#7ee787', fontFamily: 'monospace',
-    maxHeight: '200px', overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
-  errText: { color: '#f85149', fontSize: '11px', marginTop: '7px', fontFamily: 'monospace' },
+    width: '22px', height: '22px', borderRadius: '3px', border: `1px solid ${c.border}`,
+    color: c.dim, fontFamily: mono, fontSize: '11px', flexShrink: 0 },
+  stepLabel: { fontSize: '14px', fontWeight: 600, color: c.text, letterSpacing: '0.005em' },
+  stepDone: { display: 'inline-flex', alignItems: 'center', gap: '6px', marginLeft: 'auto',
+    fontFamily: mono, fontSize: '11.5px', color: c.teal },
+
+  drop: { border: `1px solid ${c.border}`, borderRadius: '6px', padding: '30px 20px',
+    textAlign: 'center', cursor: 'pointer', transition: 'border-color .15s, background .15s',
+    marginBottom: '14px', background: c.bg },
+  dropHov: { borderColor: c.teal, background: c.surface },
+  dropIcon: { color: c.dim, marginBottom: '11px', display: 'flex', justifyContent: 'center' },
+  dropText: { color: c.dim, fontSize: '13px' },
+  dropHint: { color: c.faint, fontSize: '11px', marginTop: '6px', fontFamily: mono, letterSpacing: '0.04em' },
+  fileName: { color: c.text, fontSize: '13px', fontFamily: mono, wordBreak: 'break-all' },
+
+  btn: { width: '100%', padding: '11px 14px', borderRadius: '5px', fontFamily: sans,
+    fontSize: '11.5px', fontWeight: 600, letterSpacing: '0.09em', textTransform: 'uppercase',
+    cursor: 'pointer', transition: 'opacity .15s, background .15s',
+    display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', marginBottom: '10px' },
+  btnPrimary: { background: c.teal, color: c.bg, border: `1px solid ${c.teal}` },
+  btnOutline: { background: 'transparent', color: c.tealText, border: `1px solid ${c.border}` },
+  btnGhost: { background: 'transparent', color: c.dim, border: `1px solid ${c.border}` },
+  btnOff: { opacity: 0.4, cursor: 'not-allowed' },
+
+  badge: { display: 'inline-flex', alignItems: 'center', gap: '7px', marginLeft: 'auto',
+    fontFamily: mono, fontSize: '11px', letterSpacing: '0.05em' },
+  dot: { width: '6px', height: '6px', borderRadius: '50%', flexShrink: 0 },
+
+  logLabel: { fontFamily: mono, fontSize: '10.5px', letterSpacing: '0.14em', textTransform: 'uppercase',
+    color: c.faint, marginBottom: '8px' },
+  readout: { background: c.inset, border: `1px solid ${c.border}`, borderRadius: '5px',
+    padding: '11px 13px', fontSize: '11.5px', color: c.tealText, fontFamily: mono,
+    lineHeight: 1.65, whiteSpace: 'pre-wrap', wordBreak: 'break-all', marginTop: '2px' },
+  logBox: { background: c.inset, border: `1px solid ${c.border}`, borderRadius: '5px',
+    padding: '12px 13px', fontSize: '11.5px', color: c.tealText, fontFamily: mono, lineHeight: 1.65,
+    maxHeight: '220px', overflowY: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
+  err: { display: 'flex', gap: '8px', color: c.lav, fontFamily: mono, fontSize: '11.5px',
+    marginTop: '10px', lineHeight: 1.5 },
 }
 
 export default function ServerPage() {
@@ -114,68 +170,86 @@ export default function ServerPage() {
   return (
     <div style={s.page}>
       <div style={s.card}>
-        <div style={s.title}> Server</div>
-        <div style={s.sub}>Encrypt a video and start the ICMP knock server</div>
+        <div style={s.eyebrow}>Server</div>
+        <h1 style={s.title}>Encrypt &amp; publish</h1>
+        <div style={s.sub}>Encrypt a video and bring the ICMP single-packet knock server online.</div>
 
-        {/* Step 1: Upload & Encrypt */}
+        <div style={s.rule} />
+
+        {/* Step 1 — Encrypt */}
         <div style={s.stepRow}>
           <span style={s.stepNum}>1</span>
-          <span style={s.stepLabel}>Upload &amp; Encrypt Video</span>
-          {encDone && <span style={s.stepDone}>✓ {encDone.stem}</span>}
+          <span style={s.stepLabel}>Upload &amp; encrypt video</span>
+          {encDone && (
+            <span style={s.stepDone}><Ico.check /> {encDone.stem}</span>
+          )}
         </div>
 
         <div
-          style={{ ...s.fileArea, ...(hover ? s.fileAreaHov : {}) }}
+          style={{ ...s.drop, ...(hover ? s.dropHov : {}) }}
           onClick={() => fileRef.current.click()}
           onMouseEnter={() => setHover(true)}
           onMouseLeave={() => setHover(false)}
         >
-          <div style={s.fileText}>{file ? '📹' : '📁 Click to select a video file'}</div>
-          {file  && <div style={s.fileName}>{file.name}</div>}
-          {!file && <div style={{ ...s.fileText, fontSize: '11px', marginTop: '4px' }}>MP4, AVI, MKV, MOV…</div>}
+          <div style={s.dropIcon}><Ico.upload /></div>
+          {file ? (
+            <>
+              <div style={s.fileName}>{file.name}</div>
+              <div style={s.dropHint}>Click to choose a different file</div>
+            </>
+          ) : (
+            <>
+              <div style={s.dropText}>Choose a video file</div>
+              <div style={s.dropHint}>MP4 · AVI · MKV · MOV</div>
+            </>
+          )}
         </div>
-        <input ref={fileRef} type="file" accept="video/*" onChange={handleFilePick} />
+        <input ref={fileRef} type="file" accept="video/*" onChange={handleFilePick} style={{ display: 'none' }} />
 
-        <button style={{ ...s.btn, ...s.green, ...(!file || encBusy ? s.off : {}) }}
+        <button style={{ ...s.btn, ...s.btnPrimary, ...(!file || encBusy ? s.btnOff : {}) }}
           onClick={handleEncrypt} disabled={!file || encBusy}>
-          {encBusy ? '⏳ Encrypting + Syncing…' : '🔐 Encrypt Video'}
+          <Ico.lock /> {encBusy ? 'Encrypting…' : 'Encrypt video'}
         </button>
 
-        {encErr  && <div style={s.errText}>✗ {encErr}</div>}
+        {encErr && <div style={s.err}><span>—</span><span>{encErr}</span></div>}
         {encDone && (
-          <div style={{ ...s.logBox, color: '#3fb950', maxHeight: '100px', marginTop: '4px' }}>
-            {encDone.output}
-          </div>
+          <>
+            <div style={{ ...s.logLabel, marginTop: '14px' }}>Result</div>
+            <div style={s.readout}>{encDone.output}</div>
+          </>
         )}
 
-        <div style={s.divider} />
+        <div style={s.rule} />
 
-        {/* Step 2: Start Server */}
+        {/* Step 2 — Serve */}
         <div style={s.stepRow}>
           <span style={s.stepNum}>2</span>
-          <span style={s.stepLabel}>Start Server</span>
-          <span style={{ ...s.badge, background: srvRunning ? '#1a3a2a' : '#1c1c2e' }}>
-            <span style={{ ...s.dot, background: srvRunning ? '#3fb950' : '#555' }} />
-            <span style={{ color: srvRunning ? '#3fb950' : '#8b949e' }}>
-              {srvRunning ? `Running${srvStem ? ` — ${srvStem}` : ''}` : 'Stopped'}
+          <span style={s.stepLabel}>Start server</span>
+          <span style={s.badge}>
+            <span style={{ ...s.dot, background: srvRunning ? c.teal : c.faint }} />
+            <span style={{ color: srvRunning ? c.teal : c.dim }}>
+              {srvRunning ? `Online${srvStem ? ` · ${srvStem}` : ''}` : 'Offline'}
             </span>
           </span>
         </div>
 
-        {!srvRunning
-          ? <button style={{ ...s.btn, ...s.blue, ...(!canStart || srvBusy ? s.off : {}) }}
-              onClick={handleStartServer} disabled={!canStart || srvBusy}>
-              {srvBusy ? '⏳ Starting…' : `▶ Start Server${encDone ? ` (${encDone.stem})` : ''}`}
-            </button>
-          : <button style={{ ...s.btn, ...s.red }} onClick={handleStop}>■ Stop Server</button>
-        }
+        {!srvRunning ? (
+          <button style={{ ...s.btn, ...s.btnOutline, ...(!canStart || srvBusy ? s.btnOff : {}) }}
+            onClick={handleStartServer} disabled={!canStart || srvBusy}>
+            <Ico.play /> {srvBusy ? 'Starting…' : 'Start server'}
+          </button>
+        ) : (
+          <button style={{ ...s.btn, ...s.btnGhost }} onClick={handleStop}>
+            <Ico.stop /> Stop server
+          </button>
+        )}
 
-        {srvErr && <div style={s.errText}>✗ {srvErr}</div>}
+        {srvErr && <div style={s.err}><span>—</span><span>{srvErr}</span></div>}
 
         {log && (
           <>
-            <div style={s.divider} />
-            <div style={{ fontSize: '11px', color: '#8b949e', marginBottom: '4px' }}>Server output</div>
+            <div style={s.rule} />
+            <div style={s.logLabel}>Server output</div>
             <div ref={logRef} style={s.logBox}>{log}</div>
           </>
         )}
