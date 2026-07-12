@@ -43,7 +43,12 @@ function getLocalIP() {
 // ------------------------------------------------------------------ helpers
 
 function pythonEnv() {
-  return { ...process.env }
+  return {
+    ...process.env,
+    PYTHONIOENCODING: 'utf-8',   // prevent UnicodeEncodeError on Windows cp1252
+    PYTHONUTF8: '1',             // Python 3.7+ UTF-8 mode
+    PYTHONLEGACYWINDOWSSTDIO: '0',
+  }
 }
 
 function runPython(args, opts = {}) {

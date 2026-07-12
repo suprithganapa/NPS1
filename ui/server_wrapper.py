@@ -7,6 +7,18 @@ All ICMP filtering is done in software by parse_packet() instead.
 import os
 import sys
 
+# Force UTF-8 stdout/stderr on Windows so Rich unicode chars don't crash
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 sys.path.insert(0, os.path.join(ROOT, 'scripts'))
